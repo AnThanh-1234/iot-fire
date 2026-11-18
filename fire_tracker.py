@@ -13,6 +13,11 @@ Tối ưu cho Raspberry Pi:
 - Camera đọc ở luồng riêng, luôn xử lý khung hình MỚI NHẤT (không bị trễ)
 - Camera chụp 320x240 MJPG -> giảm tải giải mã/vẽ
 
+Chuyển động servo:
+- Không thấy lửa: servo ngang quét RADAR qua lại 0°..180°, servo dọc về 90°
+- Thấy lửa: dừng radar, bám lửa. Servo do luồng riêng 50Hz điều khiển, trượt mượt
+  tới góc đích; có vùng chồng lấn (hysteresis) + lọc mượt tâm lửa để chống giật
+
 Chạy:  python fire_tracker.py              (chỉ servo theo dõi lửa)
        python fire_tracker.py --pump       (bật thêm máy bơm khi khóa mục tiêu)
        python fire_tracker.py --imgsz 256  (nhanh hơn nữa, kém chính xác hơn chút)
@@ -33,9 +38,7 @@ import numpy as np
 
 # ===================== CẤU HÌNH PHẦN CỨNG =====================
 PAN_PIN = 23          # Servo trục ngang
-TILT_PIN = 24
-
-# Servo trục dọc
+TILT_PIN = 24         # Servo trục dọc
 RELAY_PIN = 14        # IN của relay máy bơm
 RELAY_ACTIVE_HIGH = False   # Đa số module relay 5V kích mức THẤP -> False. Relay kích mức CAO -> True
 
@@ -48,18 +51,37 @@ HOME_SETTLE = 0.6               # Thời gian chờ (giây) cho servo quay tới
 PAN_DIR = 1           # Đảo chiều nếu servo xoay ngược hướng lửa (1 hoặc -1)
 TILT_DIR = -1
 
-# ===================== CẤU HÌNH CAMERA / ĐIỀU KHIỂN =====================
+# ===================== CẤU HÌNH CAMERA =====================
 FRAME_W, FRAME_H = 320, 240   # Độ phân giải camera (nhỏ = nhanh)
 NUM_THREADS = 4               # Số nhân CPU dùng cho model (Pi 4/5 có 4 nhân)
+CAM_HFOV, CAM_VFOV = 60.0, 45.0   # Góc nhìn ngang/dọc của webcam (độ) - đổi lệch pixel ra độ
 
-# Các ngưỡng tính theo TỈ LỆ khung hình -> đổi độ phân giải không cần chỉnh lại
-KP = 25.0             # Độ xoay cho mỗi 1.0 độ lệch chuẩn hóa (lệch tối đa = 0.5)
-MAX_STEP = 4.0        # Góc xoay tối đa mỗi lần cập nhật (độ) -> chống giật
-DEADZONE = 0.04       # Lệch tâm < 4% khung hình thì không xoay
-LOCK_TOLERANCE = 0.07 # Lệch tâm < 7% khung hình coi là "đã nhắm"
-LOCK_FRAMES = 4       # Số lần liên tiếp nhắm trúng mới coi là khóa mục tiêu
+# ===================== RADAR (KHÔNG THẤY LỬA) =====================
+RADAR_MIN, RADAR_MAX = 0, 180  # Vùng quét của servo ngang (độ)
+RADAR_SPEED = 30.0             # Tốc độ quét (độ/giây). Nhanh quá model sẽ bỏ sót lửa
+RADAR_START_DELAY = 1.5        # Mất lửa bao lâu (giây) thì bắt đầu quét radar
+
+# ===================== BÁM LỬA CHỐNG GIẬT =====================
+# Vùng chồng lấn (hysteresis), tính theo TỈ LỆ khung hình:
+#   lửa lệch RA NGOÀI ZONE_OUTER mới bắt đầu xoay,
+#   đã xoay thì xoay tới khi lệch VÀO TRONG ZONE_INNER mới dừng.
+#   -> lửa dao động nhẹ quanh tâm sẽ KHÔNG làm servo giật qua lại.
+ZONE_OUTER = 0.15
+ZONE_INNER = 0.05
+TRACK_GAIN = 0.6      # Mỗi lần nhận diện chỉ sửa 60% độ lệch -> không vọt lố
+CENTER_SMOOTH = 0.5   # Lọc làm mượt tâm lửa (0..1): nhỏ = mượt hơn nhưng phản ứng chậm hơn
+LOCK_TOLERANCE = 0.10 # Lệch tâm < 10% khung hình coi là "đã nhắm"
+LOCK_FRAMES = 3       # Số lần liên tiếp nhắm trúng mới coi là khóa mục tiêu
+
+# Luồng điều khiển servo chạy riêng, servo trượt mượt tới góc đích
+SERVO_RATE = 50          # Số lần cập nhật servo mỗi giây
+SERVO_MAX_SPEED = 90.0   # Tốc độ xoay tối đa khi bám lửa (độ/giây)
+SERVO_EASE = 5.0         # Độ "mềm": càng nhỏ servo càng chậm rãi khi gần tới đích
+SERVO_MIN_STEP = 0.3     # Chỉ gửi lệnh khi góc đổi > 0.3° -> bớt rung
+IDLE_DETACH = 0.8        # Đứng yên quá 0.8s thì ngắt xung PWM -> hết rung (0 = tắt tính năng)
+
+# ===================== MÁY BƠM =====================
 LOST_TIMEOUT = 1.5    # Mất dấu lửa quá bao lâu (giây) thì tắt bơm
-RETURN_HOME_AFTER = 5.0  # Không thấy lửa quá lâu thì đưa servo về vị trí ban đầu
 MAX_PUMP_TIME = 15.0  # Bảo vệ: bơm liên tục tối đa (giây), sau đó nghỉ
 PUMP_COOLDOWN = 3.0   # Thời gian nghỉ sau khi bơm quá lâu
 
@@ -76,34 +98,42 @@ YOLOV5_HUB_DIR = os.path.join(
 
 # ===================== PHẦN CỨNG (GPIO) =====================
 class Hardware:
-    """Điều khiển servo + relay. Không chạy trên Pi thì tự chuyển sang chế độ giả lập."""
+    """Servo + relay. Servo được điều khiển bởi một luồng riêng (SERVO_RATE Hz):
+    chương trình chính chỉ đặt GÓC ĐÍCH, luồng servo đưa servo trượt mượt tới đó.
+
+    Chế độ (mode):
+      "radar" - servo ngang quét qua lại RADAR_MIN..RADAR_MAX, servo dọc về TILT_HOME
+      "track" - bám theo lửa (góc đích do chương trình chính đặt)
+      "hold"  - đứng yên tại chỗ (vừa mất dấu lửa, chờ trước khi quét radar)
+    Không chạy trên Pi thì tự chuyển sang chế độ giả lập (vẫn tính góc, in log)."""
 
     def __init__(self, use_pump=False, log=True):
         self.sim = False
         self.relay = None
-        self.log = False          # Tắt log lúc đặt góc ban đầu
+        self.log = log
         self.step = 0
+        self.servos = {}
         try:
             from gpiozero import AngularServo, OutputDevice
             factory = None
             try:
-                # pigpio cho xung PWM chính xác hơn -> servo không rung
+                # pigpio cho xung PWM chính xác hơn -> servo không rung (Pi 5 không hỗ trợ)
                 # Cần: sudo apt install pigpio && sudo systemctl enable --now pigpiod
                 from gpiozero.pins.pigpio import PiGPIOFactory
                 factory = PiGPIOFactory()
                 print("[HW] Dùng pigpio (PWM chính xác, servo mượt).")
             except Exception:
-                print("[HW] Không có pigpiod -> dùng PWM phần mềm (servo có thể hơi rung).")
+                print("[HW] Không có pigpiod -> dùng PWM phần mềm "
+                      "(đã bật ngắt xung khi đứng yên để chống rung).")
 
             kw = dict(min_pulse_width=0.5 / 1000, max_pulse_width=2.5 / 1000)
             if factory:
                 kw["pin_factory"] = factory
-            # initial_angle = góc HOME -> vừa cấp xung là servo quay thẳng về 90°,
-            # không bị giật về 0° trước
-            self.pan = AngularServo(PAN_PIN, min_angle=0, max_angle=180,
-                                    initial_angle=PAN_HOME, **kw)
-            self.tilt = AngularServo(TILT_PIN, min_angle=0, max_angle=180,
-                                     initial_angle=TILT_HOME, **kw)
+            # initial_angle = góc HOME -> vừa cấp xung là servo quay thẳng về 90°
+            self.servos["pan"] = AngularServo(PAN_PIN, min_angle=0, max_angle=180,
+                                              initial_angle=PAN_HOME, **kw)
+            self.servos["tilt"] = AngularServo(TILT_PIN, min_angle=0, max_angle=180,
+                                               initial_angle=TILT_HOME, **kw)
 
             if use_pump:
                 rkw = dict(active_high=RELAY_ACTIVE_HIGH, initial_value=False)
@@ -116,48 +146,138 @@ class Hardware:
             print(f"[HW] Không khởi tạo được GPIO ({e}) -> CHẾ ĐỘ GIẢ LẬP.")
             self.sim = True
 
-        self.pan_angle = PAN_HOME
-        self.tilt_angle = TILT_HOME
         self.pump_on = False
+        self.lock = threading.Lock()
+        self.mode = "hold"
+        self.radar_dir = 1
+        self.angle = {"pan": float(PAN_HOME), "tilt": float(TILT_HOME)}    # góc hiện tại
+        self.target = {"pan": float(PAN_HOME), "tilt": float(TILT_HOME)}   # góc đích
+        self.sent = dict(self.angle)                  # góc đã gửi xuống servo lần cuối
+        self.last_move = {"pan": time.time(), "tilt": time.time()}
+        self.attached = {"pan": True, "tilt": True}
         self.go_home("Khởi động")
-        self.log = log
 
-    def go_home(self, why):
-        """Đưa cả 2 servo về góc ban đầu (90°) và chờ servo quay tới nơi."""
-        print(f"[SERVO] {why}: quay về góc ban đầu PAN {PAN_HOME}° | TILT {TILT_HOME}°")
-        if not self.sim:
-            self.pan.angle, self.tilt.angle = PAN_HOME, TILT_HOME
-            time.sleep(HOME_SETTLE)
-        self.pan_angle, self.tilt_angle = PAN_HOME, TILT_HOME
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
 
-    def set_angles(self, pan, tilt, reason="", pan_dir="", tilt_dir=""):
-        """Đặt góc 2 servo. reason/pan_dir/tilt_dir chỉ dùng để in log."""
-        want_pan, want_tilt = pan, tilt
-        pan = float(np.clip(pan, PAN_MIN, PAN_MAX))
-        tilt = float(np.clip(tilt, TILT_MIN, TILT_MAX))
-        moved_pan = abs(pan - self.pan_angle) > 0.05
-        moved_tilt = abs(tilt - self.tilt_angle) > 0.05
+    # ---------- dùng từ chương trình chính ----------
+    @property
+    def pan_angle(self):
+        return self.angle["pan"]
 
-        if self.log and (moved_pan or moved_tilt):
+    @property
+    def tilt_angle(self):
+        return self.angle["tilt"]
+
+    def get_angles(self):
+        with self.lock:
+            return self.angle["pan"], self.angle["tilt"]
+
+    def start_radar(self):
+        """Bắt đầu quét radar từ vị trí hiện tại, hướng về phía đầu xa hơn."""
+        with self.lock:
+            if self.mode == "radar":
+                return
+            self.mode = "radar"
+            self.target["pan"] = self.angle["pan"]
+            mid = (RADAR_MIN + RADAR_MAX) / 2
+            self.radar_dir = 1 if self.angle["pan"] < mid else -1
+        print(f"[SERVO] Không thấy lửa -> RADAR quét {RADAR_MIN}°↔{RADAR_MAX}° "
+              f"({RADAR_SPEED:.0f}°/s), TILT về {TILT_HOME}°")
+
+    def hold(self):
+        """Dừng tại chỗ."""
+        with self.lock:
+            self.mode = "hold"
+            self.target = dict(self.angle)
+
+    def track(self, pan=None, tilt=None, reason="BÁM LỬA"):
+        """Đặt góc đích khi bám lửa. None = giữ nguyên góc đích trục đó."""
+        with self.lock:
+            was_radar = self.mode == "radar"
+            self.mode = "track"
+            old = dict(self.target)
+            parts, clipped = [], False
+            for axis, val, lo, hi, sign, pos, neg in (
+                    ("pan", pan, PAN_MIN, PAN_MAX, PAN_DIR, "sang PHẢI", "sang TRÁI"),
+                    ("tilt", tilt, TILT_MIN, TILT_MAX, TILT_DIR, "XUỐNG", "LÊN")):
+                if val is None:
+                    continue
+                c = float(np.clip(val, lo, hi))
+                clipped |= c != val
+                self.target[axis] = c
+                d = c - old[axis]
+                if abs(d) >= SERVO_MIN_STEP:
+                    parts.append(f"{axis.upper()} {old[axis]:6.1f}° -> {c:6.1f}° "
+                                 f"({d:+5.1f}° {pos if d * sign > 0 else neg})")
+        if was_radar:
+            print(f"[SERVO] Dừng RADAR tại PAN {self.angle['pan']:.1f}° -> chuyển sang bám lửa")
+        if self.log and parts:
             self.step += 1
-            parts = []
-            if moved_pan:
-                parts.append(f"PAN {self.pan_angle:6.1f}° -> {pan:6.1f}° "
-                             f"({pan - self.pan_angle:+5.1f}°{' ' + pan_dir if pan_dir else ''})")
-            if moved_tilt:
-                parts.append(f"TILT {self.tilt_angle:6.1f}° -> {tilt:6.1f}° "
-                             f"({tilt - self.tilt_angle:+5.1f}°{' ' + tilt_dir if tilt_dir else ''})")
-            if pan != want_pan or tilt != want_tilt:
+            if clipped:
                 parts.append("[CHẠM GIỚI HẠN GÓC]")
             print(f"[SERVO #{self.step:04d}] {reason:<9} | " + " | ".join(parts))
 
-        # Chỉ gửi lệnh khi góc thực sự đổi -> đỡ tốn CPU, servo đỡ rung
+    # ---------- luồng servo ----------
+    def _loop(self):
+        dt = 1.0 / SERVO_RATE
+        while self.running:
+            t0 = time.time()
+            with self.lock:
+                if self.mode == "radar":
+                    # Góc đích chạy đều qua lại, servo bám theo mượt (đổi chiều êm ở 2 đầu)
+                    p = self.target["pan"] + self.radar_dir * RADAR_SPEED * dt
+                    if p >= RADAR_MAX:
+                        p, self.radar_dir = RADAR_MAX, -1
+                        if self.log:
+                            print(f"[RADAR] Chạm {RADAR_MAX}° -> quét ngược về {RADAR_MIN}°")
+                    elif p <= RADAR_MIN:
+                        p, self.radar_dir = RADAR_MIN, 1
+                        if self.log:
+                            print(f"[RADAR] Chạm {RADAR_MIN}° -> quét ngược về {RADAR_MAX}°")
+                    self.target["pan"] = p
+                    self.target["tilt"] = float(TILT_HOME)
+                for axis in ("pan", "tilt"):
+                    self.angle[axis] = self._approach(self.angle[axis], self.target[axis], dt)
+                angles = dict(self.angle)
+            for axis in ("pan", "tilt"):
+                self._write(axis, angles[axis], t0)
+            time.sleep(max(0.0, dt - (time.time() - t0)))
+
+    @staticmethod
+    def _approach(cur, tgt, dt):
+        """Tiến về đích: xa thì nhanh (tối đa SERVO_MAX_SPEED), gần thì chậm dần -> không giật."""
+        diff = tgt - cur
+        if abs(diff) < 0.05:
+            return tgt
+        v = float(np.clip(SERVO_EASE * diff, -SERVO_MAX_SPEED, SERVO_MAX_SPEED))
+        step = v * dt
+        return tgt if abs(step) >= abs(diff) else cur + step
+
+    def _write(self, axis, angle, now):
+        if abs(angle - self.sent[axis]) >= SERVO_MIN_STEP:
+            if not self.sim:
+                self.servos[axis].angle = angle
+            self.sent[axis] = angle
+            self.last_move[axis] = now
+            self.attached[axis] = True
+        elif (IDLE_DETACH and self.attached[axis]
+              and now - self.last_move[axis] > IDLE_DETACH):
+            # Đứng yên đủ lâu -> ngắt xung PWM: servo giữ vị trí bằng ma sát bánh răng, hết rung
+            if not self.sim:
+                self.servos[axis].detach()
+            self.attached[axis] = False
+
+    def go_home(self, why):
+        """Đưa cả 2 servo về góc ban đầu (90°) ngay lập tức và chờ servo quay tới nơi."""
+        print(f"[SERVO] {why}: quay về góc ban đầu PAN {PAN_HOME}° | TILT {TILT_HOME}°")
         if not self.sim:
-            if moved_pan:
-                self.pan.angle = pan
-            if moved_tilt:
-                self.tilt.angle = tilt
-        self.pan_angle, self.tilt_angle = pan, tilt
+            self.servos["pan"].angle = PAN_HOME
+            self.servos["tilt"].angle = TILT_HOME
+            time.sleep(HOME_SETTLE)
+        home = {"pan": float(PAN_HOME), "tilt": float(TILT_HOME)}
+        self.angle, self.target, self.sent = dict(home), dict(home), dict(home)
 
     def pump(self, on):
         if on == self.pump_on:
@@ -168,12 +288,14 @@ class Hardware:
             self.relay.on() if on else self.relay.off()
 
     def close(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
         self.pump(False)
         if self.relay is not None:
             self.relay.close()
         self.go_home("Thoát chương trình")
         if not self.sim:
-            for s in (self.pan, self.tilt):
+            for s in self.servos.values():
                 s.detach()
                 s.close()
 
@@ -435,6 +557,8 @@ def main():
     fps, t_prev, last_log = 0.0, time.time(), 0.0
     frame_id = 0
     prev_target = prev_locked = False
+    ex_f = ey_f = 0.0                    # tâm lửa đã làm mượt
+    active_x = active_y = False          # trục đang trong pha "đang xoay" (hysteresis)
 
     print("[RUN] Bắt đầu theo dõi lửa. Nhấn 'q' (hoặc Ctrl+C) để thoát.")
     try:
@@ -443,6 +567,8 @@ def main():
             if frame is None:
                 print("[CAM] Không nhận được khung hình, đang chờ...")
                 continue
+            # Góc servo ĐÚNG LÚC chụp khung hình (servo vẫn chạy trong lúc model xử lý)
+            snap_pan, snap_tilt = hw.get_angles()
 
             h, w = frame.shape[:2]
             cx, cy = w // 2, h // 2
@@ -456,33 +582,55 @@ def main():
                 tx, ty = (x1 + x2) // 2, (y1 + y2) // 2
                 ex, ey = (tx - cx) / w, (ty - cy) / h      # lệch tâm chuẩn hóa [-0.5, 0.5]
                 last_seen = now
+                first = not prev_target
 
-                # --- Điều khiển P cho servo ---
-                d_pan = 0.0 if abs(ex) < DEADZONE else np.clip(KP * ex, -MAX_STEP, MAX_STEP)
-                d_tilt = 0.0 if abs(ey) < DEADZONE else np.clip(KP * ey, -MAX_STEP, MAX_STEP)
-                hw.set_angles(hw.pan_angle + PAN_DIR * d_pan,
-                              hw.tilt_angle + TILT_DIR * d_tilt,
-                              reason="BÁM LỬA",
-                              pan_dir="sang PHẢI" if ex > 0 else "sang TRÁI",
-                              tilt_dir="XUỐNG" if ey > 0 else "LÊN")
+                # --- Làm mượt tâm lửa (khung lửa nhảy nhẹ mỗi lần nhận diện) ---
+                if first:
+                    ex_f, ey_f = ex, ey
+                    active_x = active_y = False
+                    print(f"[SERVO] Phát hiện lửa tại ({tx},{ty}) -> bắt đầu bám theo")
+                else:
+                    ex_f = CENTER_SMOOTH * ex + (1 - CENTER_SMOOTH) * ex_f
+                    ey_f = CENTER_SMOOTH * ey + (1 - CENTER_SMOOTH) * ey_f
+
+                # --- Vùng chồng lấn (hysteresis) ---
+                if abs(ex_f) > ZONE_OUTER:
+                    active_x = True
+                elif abs(ex_f) < ZONE_INNER:
+                    active_x = False
+                if abs(ey_f) > ZONE_OUTER:
+                    active_y = True
+                elif abs(ey_f) < ZONE_INNER:
+                    active_y = False
+
+                # --- Góc đích = góc lúc chụp + độ lệch đổi ra độ (chỉ sửa TRACK_GAIN phần) ---
+                new_pan = new_tilt = None
+                if active_x:
+                    new_pan = snap_pan + PAN_DIR * ex_f * CAM_HFOV * TRACK_GAIN
+                elif first:
+                    new_pan = snap_pan           # vừa thấy lửa: dừng radar ngay tại chỗ
+                if active_y:
+                    new_tilt = snap_tilt + TILT_DIR * ey_f * CAM_VFOV * TRACK_GAIN
+                elif first:
+                    new_tilt = snap_tilt
+                if new_pan is not None or new_tilt is not None or first:
+                    hw.track(new_pan, new_tilt)
 
                 # --- Kiểm tra khóa mục tiêu ---
-                if abs(ex) < LOCK_TOLERANCE and abs(ey) < LOCK_TOLERANCE:
+                if abs(ex_f) < LOCK_TOLERANCE and abs(ey_f) < LOCK_TOLERANCE:
                     lock_count = min(lock_count + 1, LOCK_FRAMES)
                 else:
                     lock_count = max(lock_count - 1, 0)
                 locked = lock_count >= LOCK_FRAMES
             else:
-                if prev_target:
-                    print("[SERVO] Mất dấu lửa -> giữ nguyên góc, chờ lửa xuất hiện lại")
                 lock_count = 0
-                if last_seen and now - last_seen > RETURN_HOME_AFTER:
-                    print(f"[SERVO] Mất lửa > {RETURN_HOME_AFTER:.0f}s -> quay về vị trí ban đầu")
-                    hw.set_angles(PAN_HOME, TILT_HOME, reason="VỀ HOME")
-                    last_seen = 0.0
+                if prev_target:
+                    print(f"[SERVO] Mất dấu lửa -> đứng yên chờ {RADAR_START_DELAY:.1f}s "
+                          "rồi quét radar")
+                    hw.hold()
+                if now - last_seen > RADAR_START_DELAY:
+                    hw.start_radar()
 
-            if target and not prev_target:
-                print(f"[SERVO] Phát hiện lửa tại ({tx},{ty}) -> bắt đầu bám theo")
             if locked != prev_locked:
                 print(f"[SERVO] {'ĐÃ KHÓA MỤC TIÊU (lửa ở giữa khung hình)' if locked else 'Mất khóa mục tiêu'}"
                       f" | PAN {hw.pan_angle:.1f}° TILT {hw.tilt_angle:.1f}°")
@@ -507,22 +655,25 @@ def main():
 
             state = ("TARGET LOCKED! PUMPING..." if hw.pump_on else
                      "TARGET LOCKED!" if locked else
-                     "TRACKING FIRE..." if target else "SCANNING...")
+                     "TRACKING FIRE..." if target else
+                     "RADAR SCANNING..." if hw.mode == "radar" else "SEARCHING...")
 
             if args.no_display:
                 if now - last_log >= 1.0:
                     last_log = now
-                    extra = (f" | {target[5]} {target[4]:.2f} lệch ({ex:+.2f},{ey:+.2f})"
+                    extra = (f" | {target[5]} {target[4]:.2f} lệch ({ex_f:+.2f},{ey_f:+.2f})"
                              if target else "")
                     print(f"[{state}] FPS {fps:.1f} | Pan {hw.pan_angle:.0f} | "
                           f"Tilt {hw.tilt_angle:.0f}{extra}")
                 continue
 
             # --- Vẽ & hiển thị (vẽ thẳng lên frame, không copy) ---
-            tol_x, tol_y = int(LOCK_TOLERANCE * w), int(LOCK_TOLERANCE * h)
             cv2.drawMarker(frame, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
-            cv2.rectangle(frame, (cx - tol_x, cy - tol_y), (cx + tol_x, cy + tol_y),
-                          (255, 255, 0), 1)
+            # Vùng vàng: lửa trong vùng này servo không xoay (vùng chồng lấn ngoài)
+            # Vùng xanh dương: vùng khóa mục tiêu
+            for frac, col in ((ZONE_OUTER, (0, 255, 255)), (LOCK_TOLERANCE, (255, 128, 0))):
+                zx, zy = int(frac * w), int(frac * h)
+                cv2.rectangle(frame, (cx - zx, cy - zy), (cx + zx, cy + zy), col, 1)
             if target:
                 color = (0, 0, 255) if locked else (0, 255, 0)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
