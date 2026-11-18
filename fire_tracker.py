@@ -24,6 +24,16 @@ Chạy:  python fire_tracker.py              (chỉ servo theo dõi lửa)
        python fire_tracker.py --pump       (bật thêm máy bơm khi khóa mục tiêu)
        python fire_tracker.py --imgsz 256  (nhanh hơn nữa, kém chính xác hơn chút)
        python fire_tracker.py --torch      (bỏ qua ONNX, dùng PyTorch như cũ)
+       python fire_tracker.py --servo hwpwm (servo dùng PWM PHẦN CỨNG - mượt nhất)
+       python fire_tracker.py --servo-trace (ghi thêm từng lệnh servo để tìm nguyên nhân giật)
+Log: mọi thông báo được lưu vào logs/fire_tracker_<ngày>_<giờ>.txt (tắt: --no-log-file)
+
+Bật PWM phần cứng (làm 1 lần) để servo hết giật:
+  1) pip install rpi-hardware-pwm
+  2) Thêm vào cuối /boot/firmware/config.txt:
+       dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+  3) sudo reboot. Cắm dây tín hiệu servo PAN -> GPIO 12 (chân 32), TILT -> GPIO 13 (chân 33)
+  4) python fire_tracker.py --servo hwpwm
 Thoát: nhấn 'q' trên cửa sổ camera (hoặc Ctrl+C trong terminal)
 """
 
@@ -108,7 +118,19 @@ SERVO_MAX_SPEED = 90.0   # Tốc độ xoay tối đa khi bám lửa (độ/giâ
 SERVO_EASE = 4.0         # Độ "mềm": càng nhỏ servo càng chậm rãi khi gần tới đích
 SERVO_LOG_INTERVAL = 0.4 # Khi bám lửa, log servo tối đa mỗi 0.4s (tránh tràn màn hình)
 SERVO_MIN_STEP = 0.3     # Chỉ gửi lệnh khi góc đổi > 0.3° -> bớt rung
-IDLE_DETACH = 0.8        # Đứng yên quá 0.8s thì ngắt xung PWM -> hết rung (0 = tắt tính năng)
+# Đứng yên quá N giây thì ngắt xung PWM (0 = TẮT). Mặc định TẮT vì khi servo quay lại,
+# xung đầu tiên sau lúc ngắt làm servo GIẬT 1 cái ở đầu mỗi lần quay.
+IDLE_DETACH = 0
+
+# Cách tạo xung servo (chọn bằng --servo):
+#   "hwpwm"   : PWM PHẦN CỨNG - xung chuẩn tuyệt đối, MƯỢT NHẤT. Servo phải cắm vào
+#               GPIO 12 (PAN) và GPIO 13 (TILT), cần cài đặt 1 lần (xem hướng dẫn).
+#   "pigpio"  : PWM qua DMA (Pi 1-4, cần pigpiod). Mượt.
+#   "gpiozero": PWM PHẦN MỀM - dễ rung/giật do CPU bận chạy AI.
+#   "auto"    : thử pigpio, không được thì gpiozero.
+HW_PWM_PAN_CHANNEL = 0    # Kênh PWM0 = GPIO 12 (chân vật lý 32)
+HW_PWM_TILT_CHANNEL = 1   # Kênh PWM1 = GPIO 13 (chân vật lý 33)
+HW_PWM_CHIP = None        # None = tự chọn (Pi 5: chip 2, Pi 1-4: chip 0)
 
 # ===================== MÁY BƠM =====================
 LOST_TIMEOUT = 1.5    # Mất dấu lửa quá bao lâu (giây) thì tắt bơm
@@ -127,6 +149,51 @@ YOLOV5_HUB_DIR = os.path.join(
 
 
 # ===================== PHẦN CỨNG (GPIO) =====================
+class HwPwmServo:
+    """Servo chạy bằng PWM PHẦN CỨNG của Pi (thư viện rpi-hardware-pwm).
+    Xung do chip tạo ra, không phụ thuộc CPU -> không rung/giật kể cả khi AI chạy nặng.
+    Dùng giống AngularServo của gpiozero: .angle = 0..180, .detach(), .close()"""
+
+    def __init__(self, channel, angle):
+        from rpi_hardware_pwm import HardwarePWM
+        chip = HW_PWM_CHIP
+        if chip is None:
+            try:
+                with open("/proc/device-tree/model") as f:
+                    chip = 2 if "Raspberry Pi 5" in f.read() else 0
+            except OSError:
+                chip = 0
+        self.chip = chip
+        self.pwm = HardwarePWM(pwm_channel=channel, hz=50, chip=chip)
+        self.pwm.start(self._duty(angle))
+        self.running = True
+
+    @staticmethod
+    def _duty(angle):
+        pulse_ms = 0.5 + float(np.clip(angle, 0, 180)) / 180.0 * 2.0   # 0.5ms..2.5ms
+        return pulse_ms / 20.0 * 100.0                                  # % của chu kỳ 20ms
+
+    @property
+    def angle(self):
+        return None
+
+    @angle.setter
+    def angle(self, value):
+        if self.running:
+            self.pwm.change_duty_cycle(self._duty(value))
+        else:
+            self.pwm.start(self._duty(value))
+            self.running = True
+
+    def detach(self):
+        if self.running:
+            self.pwm.stop()
+            self.running = False
+
+    def close(self):
+        self.detach()
+
+
 class Hardware:
     """Servo + relay. Servo được điều khiển bởi một luồng riêng (SERVO_RATE Hz):
     chương trình chính chỉ đặt GÓC ĐÍCH, luồng servo đưa servo trượt mượt tới đó.
@@ -137,33 +204,50 @@ class Hardware:
       "hold"  - đứng yên tại chỗ (vừa mất dấu lửa, chờ trước khi quét radar)
     Không chạy trên Pi thì tự chuyển sang chế độ giả lập (vẫn tính góc, in log)."""
 
-    def __init__(self, use_pump=False, log=True):
+    def __init__(self, use_pump=False, log=True, backend="auto", trace=None):
         self.sim = False
         self.relay = None
         self.log = log
         self.step = 0
         self.servos = {}
+        self.trace = trace            # file ghi từng lệnh gửi servo (--servo-trace)
+        self.t0 = time.time()
+        self.backend = "sim"
         try:
             from gpiozero import AngularServo, OutputDevice
             factory = None
-            try:
-                # pigpio cho xung PWM chính xác hơn -> servo không rung (Pi 5 không hỗ trợ)
-                # Cần: sudo apt install pigpio && sudo systemctl enable --now pigpiod
-                from gpiozero.pins.pigpio import PiGPIOFactory
-                factory = PiGPIOFactory()
-                print("[HW] Dùng pigpio (PWM chính xác, servo mượt).")
-            except Exception:
-                print("[HW] Không có pigpiod -> dùng PWM phần mềm "
-                      "(đã bật ngắt xung khi đứng yên để chống rung).")
+            if backend in ("auto", "pigpio"):
+                try:
+                    # pigpio: xung PWM qua DMA, chính xác (Pi 1-4; Pi 5 không hỗ trợ)
+                    # Cần: sudo apt install pigpio && sudo systemctl enable --now pigpiod
+                    from gpiozero.pins.pigpio import PiGPIOFactory
+                    factory = PiGPIOFactory()
+                except Exception as e:
+                    if backend == "pigpio":
+                        raise RuntimeError(f"không kết nối được pigpiod ({e})")
 
-            kw = dict(min_pulse_width=0.5 / 1000, max_pulse_width=2.5 / 1000)
-            if factory:
-                kw["pin_factory"] = factory
-            # initial_angle = góc HOME -> vừa cấp xung là servo quay thẳng về 90°
-            self.servos["pan"] = AngularServo(PAN_PIN, min_angle=0, max_angle=180,
-                                              initial_angle=PAN_HOME, **kw)
-            self.servos["tilt"] = AngularServo(TILT_PIN, min_angle=0, max_angle=180,
-                                               initial_angle=TILT_HOME, **kw)
+            if backend == "hwpwm":
+                self.servos["pan"] = HwPwmServo(HW_PWM_PAN_CHANNEL, PAN_HOME)
+                self.servos["tilt"] = HwPwmServo(HW_PWM_TILT_CHANNEL, TILT_HOME)
+                self.backend = "hwpwm"
+                print(f"[HW] Servo dùng PWM PHẦN CỨNG (chip {self.servos['pan'].chip}): "
+                      "PAN = GPIO 12, TILT = GPIO 13 -> mượt nhất.")
+            else:
+                kw = dict(min_pulse_width=0.5 / 1000, max_pulse_width=2.5 / 1000)
+                if factory:
+                    kw["pin_factory"] = factory
+                # initial_angle = góc HOME -> vừa cấp xung là servo quay thẳng về 90°
+                self.servos["pan"] = AngularServo(PAN_PIN, min_angle=0, max_angle=180,
+                                                  initial_angle=PAN_HOME, **kw)
+                self.servos["tilt"] = AngularServo(TILT_PIN, min_angle=0, max_angle=180,
+                                                   initial_angle=TILT_HOME, **kw)
+                if factory:
+                    self.backend = "pigpio"
+                    print("[HW] Servo dùng pigpio (PWM qua DMA, mượt).")
+                else:
+                    self.backend = "gpiozero"
+                    print("[HW] CẢNH BÁO: servo dùng PWM PHẦN MỀM -> dễ rung/giật. "
+                          "Nên dùng --servo hwpwm (xem hướng dẫn trong file).")
 
             if use_pump:
                 rkw = dict(active_high=RELAY_ACTIVE_HIGH, initial_value=False)
@@ -173,6 +257,16 @@ class Hardware:
             else:
                 print("[HW] Máy bơm TẮT (chỉ servo theo dõi lửa). Dùng --pump để bật.")
         except Exception as e:
+            if backend == "hwpwm":
+                raise SystemExit(
+                    f"[LỖI] Không bật được PWM phần cứng: {e}\n"
+                    "  1) pip install rpi-hardware-pwm\n"
+                    "  2) Thêm vào cuối /boot/firmware/config.txt dòng:\n"
+                    "       dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4\n"
+                    "  3) sudo reboot, rồi cắm servo PAN vào GPIO 12, TILT vào GPIO 13")
+            if backend == "pigpio":
+                raise SystemExit(f"[LỖI] Không dùng được pigpio: {e}\n"
+                                 "  sudo apt install -y pigpio && sudo systemctl enable --now pigpiod")
             print(f"[HW] Không khởi tạo được GPIO ({e}) -> CHẾ ĐỘ GIẢ LẬP.")
             self.sim = True
 
@@ -326,6 +420,9 @@ class Hardware:
         if abs(angle - self.sent[axis]) >= SERVO_MIN_STEP:
             if not self.sim:
                 self.servos[axis].angle = angle
+            if self.trace:
+                self.trace.write(f"{now - self.t0:8.3f}\t{axis}\t{angle:.2f}\t"
+                                 f"{'' if self.attached[axis] else 'REATTACH'}\t{self.mode}\n")
             self.sent[axis] = angle
             self.last_move[axis] = now
             self.attached[axis] = True
@@ -334,6 +431,8 @@ class Hardware:
             # Đứng yên đủ lâu -> ngắt xung PWM: servo giữ vị trí bằng ma sát bánh răng, hết rung
             if not self.sim:
                 self.servos[axis].detach()
+            if self.trace:
+                self.trace.write(f"{now - self.t0:8.3f}\t{axis}\t{angle:.2f}\tDETACH\t{self.mode}\n")
             self.attached[axis] = False
 
     def go_home(self, why):
@@ -638,6 +737,56 @@ def color_track(frame, box):
     return fx, fy, (int(fx - bw / 2), int(fy - bh / 2), int(fx + bw / 2), int(fy + bh / 2))
 
 
+class TeeLog:
+    """Mọi thứ in ra màn hình đều được ghi thêm vào file txt, mỗi dòng kèm thời gian."""
+
+    def __init__(self, stream, f, lock):
+        self.stream, self.f, self.lock = stream, f, lock
+        self.line_start = True
+
+    def write(self, s):
+        try:
+            self.stream.write(s)
+        except Exception:
+            pass
+        with self.lock:
+            out = []
+            for part in s.splitlines(keepends=True):
+                if self.line_start:
+                    t = time.time()
+                    out.append(time.strftime("%H:%M:%S", time.localtime(t)) + f".{int(t * 1000) % 1000:03d} ")
+                out.append(part)
+                self.line_start = part.endswith("\n")
+            self.f.write("".join(out))
+        return len(s)
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        self.f.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def setup_file_log(log_dir, args):
+    """Bắt đầu ghi log ra logs/fire_tracker_<ngày>_<giờ>.txt. Trả về đường dẫn file."""
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, time.strftime("fire_tracker_%Y%m%d_%H%M%S.txt"))
+    f = open(path, "w", encoding="utf-8", buffering=1)     # ghi từng dòng -> Ctrl+C không mất log
+    f.write(f"===== FIRE TRACKER LOG - bắt đầu {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    f.write(f"Lệnh chạy : {' '.join(sys.argv)}\n")
+    f.write(f"Cấu hình  : PAN_PIN={PAN_PIN} TILT_PIN={TILT_PIN} PAN_DIR={PAN_DIR} "
+            f"TILT_DIR={TILT_DIR} servo={args.servo} imgsz={args.imgsz} conf={args.conf}\n")
+    f.write("=" * 60 + "\n")
+    lock = threading.Lock()
+    sys.stdout = TeeLog(sys.stdout, f, lock)
+    sys.stderr = TeeLog(sys.stderr, f, lock)               # ghi cả lỗi/cảnh báo
+    return path
+
+
 def remember_hotspot(hotspots, pan, tilt, now):
     """Bộ nhớ các chỗ từng có lửa: gộp điểm gần nhau (< 10°), giữ 5 chỗ mới nhất."""
     for hs in hotspots:
@@ -668,7 +817,25 @@ def main():
     ap.add_argument("--torch", action="store_true", help="Dùng PyTorch thay vì ONNX")
     ap.add_argument("--no-servo-log", action="store_true", help="Không in log từng bước xoay servo")
     ap.add_argument("--no-display", action="store_true", help="Không hiển thị cửa sổ")
+    ap.add_argument("--servo", default="auto", choices=["auto", "hwpwm", "pigpio", "gpiozero"],
+                    help="Cách tạo xung servo. hwpwm = PWM phần cứng (mượt nhất, servo ở GPIO 12/13)")
+    ap.add_argument("--log-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+                    help="Thư mục lưu file log .txt (mặc định: logs/ cạnh script)")
+    ap.add_argument("--no-log-file", action="store_true", help="Không ghi log ra file")
+    ap.add_argument("--servo-trace", action="store_true",
+                    help="Ghi THÊM từng lệnh gửi servo ra file servo_trace_*.txt (để tìm nguyên nhân giật)")
     args = ap.parse_args()
+
+    if not args.no_log_file:
+        log_path = setup_file_log(args.log_dir, args)
+        print(f"[LOG] Đang ghi log vào: {log_path}")
+    trace = None
+    if args.servo_trace:
+        os.makedirs(args.log_dir, exist_ok=True)
+        tpath = os.path.join(args.log_dir, time.strftime("servo_trace_%Y%m%d_%H%M%S.txt"))
+        trace = open(tpath, "w", encoding="utf-8", buffering=1)
+        trace.write("giay\ttruc\tgoc\tsu_kien\tche_do\n")
+        print(f"[LOG] Đang ghi từng lệnh servo vào: {tpath}")
 
     fire_classes = {c.strip().lower() for c in args.classes.split(",") if c.strip()}
 
@@ -687,7 +854,7 @@ def main():
         print(f"[MODEL] Không có lớp {sorted(fire_classes)} trong model -> coi mọi vật là lửa.")
         fire_classes = set()
 
-    hw = Hardware(use_pump=args.pump, log=not args.no_servo_log)
+    hw = Hardware(use_pump=args.pump, log=not args.no_servo_log, backend=args.servo, trace=trace)
     try:
         cam = Camera(args.cam, FRAME_W, FRAME_H)
     except RuntimeError as e:
@@ -959,6 +1126,8 @@ def main():
         cam.release()
         cv2.destroyAllWindows()
         print("[RUN] Đã dừng và giải phóng tài nguyên.")
+        if trace:
+            trace.close()
 
 
 if __name__ == "__main__":
