@@ -16,7 +16,9 @@ Tối ưu cho Raspberry Pi:
 Chuyển động servo:
 - Không thấy lửa: servo ngang quét RADAR qua lại 0°..180°, servo dọc về 90°
 - Thấy lửa: dừng radar, bám lửa. Servo do luồng riêng 50Hz điều khiển, trượt mượt
-  tới góc đích; có vùng chồng lấn (hysteresis) + lọc mượt tâm lửa để chống giật
+  tới góc đích; có vùng chồng lấn (hysteresis) + lọc mượt hướng lửa để chống giật
+- AI (YOLO ~4 FPS) chạy ở luồng riêng chỉ để phát hiện/xác nhận lửa; giữa các lần AI,
+  vị trí lửa được bám bằng lọc màu ở tốc độ camera (~25-30 FPS) -> servo không giật
 
 Chạy:  python fire_tracker.py              (chỉ servo theo dõi lửa)
        python fire_tracker.py --pump       (bật thêm máy bơm khi khóa mục tiêu)
@@ -59,24 +61,52 @@ CAM_HFOV, CAM_VFOV = 60.0, 45.0   # Góc nhìn ngang/dọc của webcam (độ) 
 # ===================== RADAR (KHÔNG THẤY LỬA) =====================
 RADAR_MIN, RADAR_MAX = 0, 180  # Vùng quét của servo ngang (độ)
 RADAR_SPEED = 30.0             # Tốc độ quét (độ/giây). Nhanh quá model sẽ bỏ sót lửa
-RADAR_START_DELAY = 1.5        # Mất lửa bao lâu (giây) thì bắt đầu quét radar
+
+# ===================== BỘ NHỚ LỬA =====================
+# Mất dấu lửa (hoặc radar lướt qua lửa): KHÔNG quét lại từ đầu mà
+#   1) QUAY LẠI chỗ lửa cuối cùng (có dự đoán theo hướng lửa đang di chuyển), đứng chờ AI
+#   2) QUÉT HẸP quanh chỗ đó
+#   3) vẫn không thấy mới QUÉT RADAR toàn bộ; radar đi chậm lại ở những chỗ từng có lửa
+RECALL_DWELL = 1.2     # Đứng chờ AI tại chỗ lửa cuối cùng bao lâu (giây)
+PREDICT_TIME = 0.5     # Dự đoán lửa đi thêm bao lâu theo vận tốc lúc mất dấu (giây)
+LOCAL_RANGE = 25.0     # Quét hẹp ± 25° quanh chỗ lửa cuối cùng
+LOCAL_SPEED = 20.0     # Tốc độ quét hẹp (độ/giây)
+LOCAL_TURNS = 3        # Số lần chạm biên khi quét hẹp (3 = qua lại đủ 1.5 lượt)
+HOTSPOT_TTL = 120.0    # Nhớ các chỗ từng có lửa trong 120 giây
+HOTSPOT_RANGE = 15.0   # Radar đi qua gần chỗ từng có lửa (± 15°)...
+HOTSPOT_SLOW = 0.4     # ...thì chậm lại còn 40% tốc độ để AI kịp nhận diện
+
+# ===================== TỰ PHÁT HIỆN SERVO QUAY NGƯỢC =====================
+# Khi servo xoay mà lửa trong ảnh dịch NGƯỢC với dự đoán -> PAN_DIR/TILT_DIR bị sai,
+# chương trình tự đảo chiều và in ra giá trị đúng để sửa vĩnh viễn trong file.
+AUTO_DIR = True
+AUTO_DIR_MIN_MOVE = 3.0   # Servo phải xoay tổng cộng ≥ 3° trong lúc thấy lửa mới kết luận
 
 # ===================== BÁM LỬA CHỐNG GIẬT =====================
+# AI (YOLO) chậm (~4 FPS trên Pi) nên chạy ở LUỒNG RIÊNG, chỉ để PHÁT HIỆN / XÁC NHẬN lửa.
+# Giữa 2 lần AI chạy, vị trí lửa được bám bằng LỌC MÀU LỬA (rất nhẹ) ở tốc độ camera
+# (~25-30 FPS) -> servo nhận vị trí lửa liên tục, không phải chờ AI -> chuyển động mượt.
+FAST_TRACK = True         # False = chỉ dùng AI (giật hơn)
+ROI_EXPAND = 1.8          # Vùng tìm màu lửa = khung lửa của AI phóng to 1.8 lần
+FIRE_V_MIN = 190          # Độ sáng tối thiểu của điểm ảnh lửa (0-255). Phòng tối có thể giảm 160
+FIRE_MIN_PIXELS = 12      # Ít hơn số điểm ảnh này coi như lọc màu không thấy lửa
+AI_CONFIRM_TIMEOUT = 1.0  # AI không thấy lửa quá 1s thì bỏ bám (chống bám nhầm đèn/nắng)
+
 # Vùng chồng lấn (hysteresis), tính theo TỈ LỆ khung hình:
 #   lửa lệch RA NGOÀI ZONE_OUTER mới bắt đầu xoay,
 #   đã xoay thì xoay tới khi lệch VÀO TRONG ZONE_INNER mới dừng.
 #   -> lửa dao động nhẹ quanh tâm sẽ KHÔNG làm servo giật qua lại.
-ZONE_OUTER = 0.15
-ZONE_INNER = 0.05
-TRACK_GAIN = 0.6      # Mỗi lần nhận diện chỉ sửa 60% độ lệch -> không vọt lố
-CENTER_SMOOTH = 0.5   # Lọc làm mượt tâm lửa (0..1): nhỏ = mượt hơn nhưng phản ứng chậm hơn
+ZONE_OUTER = 0.12
+ZONE_INNER = 0.04
+WORLD_SMOOTH = 0.25   # Lọc mượt vị trí lửa mỗi khung hình (0..1): nhỏ = mượt hơn, phản ứng chậm hơn
 LOCK_TOLERANCE = 0.10 # Lệch tâm < 10% khung hình coi là "đã nhắm"
-LOCK_FRAMES = 3       # Số lần liên tiếp nhắm trúng mới coi là khóa mục tiêu
+LOCK_FRAMES = 8       # Số khung hình liên tiếp nhắm trúng mới coi là khóa mục tiêu
 
 # Luồng điều khiển servo chạy riêng, servo trượt mượt tới góc đích
 SERVO_RATE = 50          # Số lần cập nhật servo mỗi giây
 SERVO_MAX_SPEED = 90.0   # Tốc độ xoay tối đa khi bám lửa (độ/giây)
-SERVO_EASE = 5.0         # Độ "mềm": càng nhỏ servo càng chậm rãi khi gần tới đích
+SERVO_EASE = 4.0         # Độ "mềm": càng nhỏ servo càng chậm rãi khi gần tới đích
+SERVO_LOG_INTERVAL = 0.4 # Khi bám lửa, log servo tối đa mỗi 0.4s (tránh tràn màn hình)
 SERVO_MIN_STEP = 0.3     # Chỉ gửi lệnh khi góc đổi > 0.3° -> bớt rung
 IDLE_DETACH = 0.8        # Đứng yên quá 0.8s thì ngắt xung PWM -> hết rung (0 = tắt tính năng)
 
@@ -155,6 +185,9 @@ class Hardware:
         self.sent = dict(self.angle)                  # góc đã gửi xuống servo lần cuối
         self.last_move = {"pan": time.time(), "tilt": time.time()}
         self.attached = {"pan": True, "tilt": True}
+        self._log_t, self._log_ref = 0.0, dict(self.target)   # chống spam log
+        self.hotspots = []          # các góc PAN từng có lửa (radar đi chậm lại ở đó)
+        self.sweep, self.search_done = None, False
         self.go_home("Khởi động")
 
         self.running = True
@@ -192,32 +225,53 @@ class Hardware:
             self.mode = "hold"
             self.target = dict(self.angle)
 
-    def track(self, pan=None, tilt=None, reason="BÁM LỬA"):
-        """Đặt góc đích khi bám lửa. None = giữ nguyên góc đích trục đó."""
+    def start_search(self, center, tilt, rng, speed, turns):
+        """Quét hẹp quanh `center` (± rng độ), chạm biên `turns` lần thì xong (search_done)."""
+        lo, hi = max(PAN_MIN, center - rng), min(PAN_MAX, center + rng)
         with self.lock:
-            was_radar = self.mode == "radar"
+            self.mode = "search"
+            self.sweep = dict(lo=lo, hi=hi, speed=speed, turns=turns,
+                              tilt=float(np.clip(tilt, TILT_MIN, TILT_MAX)))
+            self.target["pan"] = self.angle["pan"]
+            self.radar_dir = 1 if self.angle["pan"] < (lo + hi) / 2 else -1
+            self.search_done = False
+        print(f"[NHỚ] Quét hẹp quanh PAN {center:.0f}° ({lo:.0f}°↔{hi:.0f}°, {speed:.0f}°/s)")
+
+    def track(self, pan=None, tilt=None, reason="BÁM LỬA"):
+        """Đặt góc đích khi bám lửa. None = giữ nguyên góc đích trục đó.
+        Được gọi ~30 lần/giây nên log chỉ in mỗi SERVO_LOG_INTERVAL giây."""
+        clipped = False
+        with self.lock:
+            was_radar = self.mode in ("radar", "search")
             self.mode = "track"
-            old = dict(self.target)
-            parts, clipped = [], False
-            for axis, val, lo, hi, sign, pos, neg in (
-                    ("pan", pan, PAN_MIN, PAN_MAX, PAN_DIR, "sang PHẢI", "sang TRÁI"),
-                    ("tilt", tilt, TILT_MIN, TILT_MAX, TILT_DIR, "XUỐNG", "LÊN")):
+            for axis, val, lo, hi in (("pan", pan, PAN_MIN, PAN_MAX),
+                                      ("tilt", tilt, TILT_MIN, TILT_MAX)):
                 if val is None:
                     continue
                 c = float(np.clip(val, lo, hi))
                 clipped |= c != val
                 self.target[axis] = c
-                d = c - old[axis]
-                if abs(d) >= SERVO_MIN_STEP:
-                    parts.append(f"{axis.upper()} {old[axis]:6.1f}° -> {c:6.1f}° "
-                                 f"({d:+5.1f}° {pos if d * sign > 0 else neg})")
+            new = dict(self.target)
+            if was_radar:
+                self._log_ref = dict(self.angle)
         if was_radar:
-            print(f"[SERVO] Dừng RADAR tại PAN {self.angle['pan']:.1f}° -> chuyển sang bám lửa")
-        if self.log and parts:
+            print(f"[SERVO] Dừng quét tại PAN {self.angle['pan']:.1f}° -> chuyển sang bám lửa")
+        now = time.time()
+        if not self.log or now - self._log_t < SERVO_LOG_INTERVAL:
+            return
+        parts = []
+        for axis, sign, pos, neg in (("pan", PAN_DIR, "sang PHẢI", "sang TRÁI"),
+                                     ("tilt", TILT_DIR, "XUỐNG", "LÊN")):
+            d = new[axis] - self._log_ref[axis]
+            if abs(d) >= SERVO_MIN_STEP:
+                parts.append(f"{axis.upper()} {self._log_ref[axis]:6.1f}° -> {new[axis]:6.1f}° "
+                             f"({d:+5.1f}° {pos if d * sign > 0 else neg})")
+        if parts:
             self.step += 1
             if clipped:
                 parts.append("[CHẠM GIỚI HẠN GÓC]")
             print(f"[SERVO #{self.step:04d}] {reason:<9} | " + " | ".join(parts))
+            self._log_t, self._log_ref = now, new
 
     # ---------- luồng servo ----------
     def _loop(self):
@@ -225,19 +279,32 @@ class Hardware:
         while self.running:
             t0 = time.time()
             with self.lock:
-                if self.mode == "radar":
+                if self.mode in ("radar", "search"):
                     # Góc đích chạy đều qua lại, servo bám theo mượt (đổi chiều êm ở 2 đầu)
-                    p = self.target["pan"] + self.radar_dir * RADAR_SPEED * dt
-                    if p >= RADAR_MAX:
-                        p, self.radar_dir = RADAR_MAX, -1
+                    if self.mode == "radar":
+                        lo, hi, speed, tilt = RADAR_MIN, RADAR_MAX, RADAR_SPEED, TILT_HOME
+                        # Gần chỗ từng có lửa -> đi chậm lại cho AI kịp nhận diện
+                        if any(abs(self.angle["pan"] - hp) < HOTSPOT_RANGE for hp in self.hotspots):
+                            speed *= HOTSPOT_SLOW
+                    else:
+                        sw = self.sweep
+                        lo, hi, speed, tilt = sw["lo"], sw["hi"], sw["speed"], sw["tilt"]
+                    p = self.target["pan"] + self.radar_dir * speed * dt
+                    edge = None
+                    if p >= hi:
+                        p, self.radar_dir, edge = hi, -1, hi
+                    elif p <= lo:
+                        p, self.radar_dir, edge = lo, 1, lo
+                    if edge is not None:
+                        tag = "RADAR" if self.mode == "radar" else "QUÉT HẸP"
                         if self.log:
-                            print(f"[RADAR] Chạm {RADAR_MAX}° -> quét ngược về {RADAR_MIN}°")
-                    elif p <= RADAR_MIN:
-                        p, self.radar_dir = RADAR_MIN, 1
-                        if self.log:
-                            print(f"[RADAR] Chạm {RADAR_MIN}° -> quét ngược về {RADAR_MAX}°")
+                            print(f"[{tag}] Chạm {edge:.0f}° -> quét ngược lại")
+                        if self.mode == "search":
+                            sw["turns"] -= 1
+                            if sw["turns"] <= 0:
+                                self.mode, self.search_done = "hold", True
                     self.target["pan"] = p
-                    self.target["tilt"] = float(TILT_HOME)
+                    self.target["tilt"] = float(tilt)
                 for axis in ("pan", "tilt"):
                     self.angle[axis] = self._approach(self.angle[axis], self.target[axis], dt)
                 angles = dict(self.angle)
@@ -510,8 +577,84 @@ def pick_target(dets, fire_classes):
     return max(fires, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
 
 
+class AsyncDetector:
+    """Chạy YOLO ở luồng nền trên khung hình mới nhất -> luồng chính không phải chờ AI."""
+
+    def __init__(self, detector, cam, hw, fire_classes):
+        self.detector, self.cam, self.hw, self.fire_classes = detector, cam, hw, fire_classes
+        self.lock = threading.Lock()
+        self.result = None       # (seq, target, (pan, tilt) lúc chụp)
+        self.seq = 0
+        self.fps = 0.0
+        self.error = None
+        self.running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        fid, t_prev = 0, time.time()
+        try:
+            while self.running:
+                fid, frame = self.cam.read(fid)
+                if frame is None:
+                    continue
+                snap = self.hw.get_angles()          # góc servo đúng lúc chụp khung hình
+                target = pick_target(self.detector.detect(frame), self.fire_classes)
+                now = time.time()
+                dt, t_prev = now - t_prev, now
+                with self.lock:
+                    self.seq += 1
+                    self.result = (self.seq, target, snap)
+                    self.fps = 0.8 * self.fps + 0.2 * (1.0 / dt if dt > 0 else 0)
+        except Exception as e:
+            self.error = e
+
+    def latest(self):
+        with self.lock:
+            return self.result
+
+    def stop(self):
+        self.running = False
+
+
+def color_track(frame, box):
+    """Tìm tâm vùng màu lửa (sáng, đỏ-cam-vàng hoặc lõi trắng) quanh khung lửa cũ.
+    Trả về (x, y, khung_mới) hoặc None. Chỉ xử lý vùng nhỏ nên rất nhanh."""
+    H, W = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    bw, bh = max(x2 - x1, 8), max(y2 - y1, 8)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    rx, ry = bw * ROI_EXPAND / 2, bh * ROI_EXPAND / 2
+    ax1, ay1 = max(0, int(cx - rx)), max(0, int(cy - ry))
+    ax2, ay2 = min(W, int(cx + rx)), min(H, int(cy + ry))
+    if ax2 - ax1 < 4 or ay2 - ay1 < 4:
+        return None
+    hsv = cv2.cvtColor(frame[ay1:ay2, ax1:ax2], cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    mask = ((v >= FIRE_V_MIN) & ((h <= 35) | (h >= 165) | (s <= 60))).astype(np.uint8)
+    m = cv2.moments(mask, binaryImage=True)
+    if m["m00"] < FIRE_MIN_PIXELS:
+        return None
+    fx, fy = ax1 + m["m10"] / m["m00"], ay1 + m["m01"] / m["m00"]
+    return fx, fy, (int(fx - bw / 2), int(fy - bh / 2), int(fx + bw / 2), int(fy + bh / 2))
+
+
+def remember_hotspot(hotspots, pan, tilt, now):
+    """Bộ nhớ các chỗ từng có lửa: gộp điểm gần nhau (< 10°), giữ 5 chỗ mới nhất."""
+    for hs in hotspots:
+        if abs(hs[0] - pan) < 10:
+            hs[0] += 0.3 * (pan - hs[0])
+            hs[1] += 0.3 * (tilt - hs[1])
+            hs[2] = now
+            break
+    else:
+        hotspots.append([pan, tilt, now])
+    hotspots[:] = sorted((hs for hs in hotspots if now - hs[2] < HOTSPOT_TTL),
+                         key=lambda hs: -hs[2])[:5]
+
+
 # ===================== CHƯƠNG TRÌNH CHÍNH =====================
 def main():
+    global PAN_DIR, TILT_DIR          # có thể tự đảo khi phát hiện servo quay ngược (AUTO_DIR)
     ap = argparse.ArgumentParser(description="Raspberry Pi Fire Tracker")
     ap.add_argument("--model", default="fire_yolov5s.pt", help="File trọng số YOLOv5 nhận diện lửa")
     ap.add_argument("--cam", type=int, default=0, help="Chỉ số webcam")
@@ -551,90 +694,205 @@ def main():
         hw.close()
         raise SystemExit(f"[LỖI] {e}")
 
+    ai = AsyncDetector(detector, cam, hw, fire_classes)
+
     lock_count = 0
-    last_seen = 0.0
+    last_seen = ai_seen = 0.0
     pump_start = cooldown_until = 0.0
     fps, t_prev, last_log = 0.0, time.time(), 0.0
-    frame_id = 0
-    prev_target = prev_locked = False
-    ex_f = ey_f = 0.0                    # tâm lửa đã làm mượt
+    frame_id, last_seq = 0, 0
+    box, conf, name = None, 0.0, "fire"  # khung lửa đang bám (tọa độ khung hình hiện tại)
+    meas = None                          # tâm lửa đo được ở khung hình này
+    need_init = False
+    world_pan = world_tilt = 0.0         # hướng của ngọn lửa (độ, đã lọc mượt)
     active_x = active_y = False          # trục đang trong pha "đang xoay" (hysteresis)
+    prev_present = prev_locked = False
+    # Bộ nhớ lửa
+    hotspots = []                        # [[pan, tilt, thời điểm]] các chỗ từng có lửa
+    vel_pan = vel_tilt = 0.0             # vận tốc hướng lửa (độ/giây)
+    prev_world = None
+    phase, phase_t, arrive_t, mem = "radar", 0.0, None, None
+    # Tự phát hiện chiều ngược: tổng (Δlệch·Δgóc), tổng (Δgóc²), tổng |Δgóc|
+    cal = {"pan": [0.0, 0.0, 0.0], "tilt": [0.0, 0.0, 0.0]}
+    dir_ok = {"pan": False, "tilt": False}
+    prev_m = ai_raw = None
 
     print("[RUN] Bắt đầu theo dõi lửa. Nhấn 'q' (hoặc Ctrl+C) để thoát.")
     try:
         while True:
+            if ai.error:
+                raise RuntimeError(f"Luồng AI bị lỗi: {ai.error}")
             frame_id, frame = cam.read(frame_id)
             if frame is None:
                 print("[CAM] Không nhận được khung hình, đang chờ...")
                 continue
-            # Góc servo ĐÚNG LÚC chụp khung hình (servo vẫn chạy trong lúc model xử lý)
-            snap_pan, snap_tilt = hw.get_angles()
-
+            snap_pan, snap_tilt = hw.get_angles()   # góc servo lúc có khung hình này
             h, w = frame.shape[:2]
             cx, cy = w // 2, h // 2
             now = time.time()
 
-            target = pick_target(detector.detect(frame), fire_classes)
+            # --- 1. Có kết quả AI mới? ---
+            res = ai.latest()
+            ai_new = res is not None and res[0] != last_seq
+            ai_hit = False
+            if ai_new:
+                last_seq, ai_target, (a_pan, a_tilt) = res
+                if ai_target:
+                    ai_hit, ai_seen = True, now
+                    x1, y1, x2, y2, conf, name = ai_target
+                    # Khung của AI tính trên khung hình CŨ -> dịch theo góc servo đã xoay từ đó
+                    dx = -PAN_DIR * (snap_pan - a_pan) / CAM_HFOV * w
+                    dy = -TILT_DIR * (snap_tilt - a_tilt) / CAM_VFOV * h
+                    # Hướng lửa lúc AI chụp (đúng cả khi radar đã lướt qua) -> ghi vào bộ nhớ
+                    hp = a_pan + PAN_DIR * ((x1 + x2) / 2 - cx) / w * CAM_HFOV
+                    ht = a_tilt + TILT_DIR * ((y1 + y2) / 2 - cy) / h * CAM_VFOV
+                    # Mẫu hiệu chỉnh chiều: vị trí GỐC trong ảnh AI + góc servo lúc AI chụp
+                    ai_raw = (((x1 + x2) / 2 - cx) / w, ((y1 + y2) / 2 - cy) / h, a_pan, a_tilt)
+                    remember_hotspot(hotspots, hp, ht, now)
+                    hw.hotspots = [hs[0] for hs in hotspots]
+                    if box is None:
+                        print(f"[SERVO] AI phát hiện lửa ({name} {conf:.2f}) tại hướng "
+                              f"PAN {hp:.1f}° TILT {ht:.1f}° -> quay thẳng về đó")
+                        hw.track(hp, ht)       # radar có lướt quá cũng quay lại đúng chỗ
+                        need_init, active_x, active_y = True, False, False
+                        prev_m, prev_world = None, None
+                    box = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
+            if box is not None and now - ai_seen > AI_CONFIRM_TIMEOUT:
+                box = None                                  # AI lâu rồi không xác nhận -> bỏ
+
+            # --- 2. Đo tâm lửa ở khung hình hiện tại ---
+            meas = samp = None
+            if box is not None:
+                if FAST_TRACK:
+                    r = color_track(frame, box)
+                    if r:
+                        fx, fy, box = r
+                        meas = (fx, fy)
+                        samp = ((fx - cx) / w, (fy - cy) / h, snap_pan, snap_tilt)
+                if meas is None and ai_hit:
+                    meas = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                    samp = ai_raw
+            present = box is not None
             locked = False
 
-            if target:
-                x1, y1, x2, y2, conf, name = target
-                tx, ty = (x1 + x2) // 2, (y1 + y2) // 2
-                ex, ey = (tx - cx) / w, (ty - cy) / h      # lệch tâm chuẩn hóa [-0.5, 0.5]
+            # --- 3. Điều khiển servo ---
+            if meas:
                 last_seen = now
-                first = not prev_target
+                ex, ey = (meas[0] - cx) / w, (meas[1] - cy) / h
 
-                # --- Làm mượt tâm lửa (khung lửa nhảy nhẹ mỗi lần nhận diện) ---
-                if first:
-                    ex_f, ey_f = ex, ey
-                    active_x = active_y = False
-                    print(f"[SERVO] Phát hiện lửa tại ({tx},{ty}) -> bắt đầu bám theo")
+                # --- Tự phát hiện servo quay ngược ---
+                # Lửa đứng yên: servo xoay Δgóc thì lửa trong ảnh phải dịch
+                # Δlệch ≈ -DIR·Δgóc/FOV. Nếu thực tế dịch cùng chiều -> DIR bị sai.
+                # (Dùng vị trí đo THẬT trong ảnh + góc lúc chụp ảnh đó, không dùng khung đã dịch bù)
+                if AUTO_DIR and prev_m is not None:
+                    for key, e, pe, a, pa, fov in (
+                            ("pan", samp[0], prev_m[0], samp[2], prev_m[2], CAM_HFOV),
+                            ("tilt", samp[1], prev_m[1], samp[3], prev_m[3], CAM_VFOV)):
+                        da = a - pa
+                        if not 0.2 < abs(da) < 15:
+                            continue
+                        c = cal[key]
+                        c[0] += (e - pe) * fov * da
+                        c[1] += da * da
+                        c[2] += abs(da)
+                        if c[2] < AUTO_DIR_MIN_MOVE:
+                            continue
+                        k = c[0] / c[1]                     # ≈ -DIR nếu đúng chiều
+                        d = PAN_DIR if key == "pan" else TILT_DIR
+                        if k * d > 0.3:
+                            d = -d
+                            if key == "pan":
+                                PAN_DIR = d
+                            else:
+                                TILT_DIR = d
+                            print(f"[CALIB] Servo {key.upper()} đang quay NGƯỢC hướng lửa -> tự đảo "
+                                  f"chiều. Sửa vĩnh viễn trong file: {key.upper()}_DIR = {d}")
+                            need_init, active_x, active_y = True, False, False
+                            prev_world = None
+                        elif k * d < -0.3 and not dir_ok[key]:
+                            dir_ok[key] = True
+                            print(f"[CALIB] Chiều servo {key.upper()} đúng ({key.upper()}_DIR = {d})")
+                        c[:] = [0.0, 0.0, 0.0]
+                prev_m = samp
+
+                # Hướng thật của ngọn lửa = góc servo + độ lệch đổi ra độ
+                wp = snap_pan + PAN_DIR * ex * CAM_HFOV
+                wt = snap_tilt + TILT_DIR * ey * CAM_VFOV
+                if need_init:
+                    world_pan, world_tilt, need_init = wp, wt, False
+                    vel_pan = vel_tilt = 0.0
                 else:
-                    ex_f = CENTER_SMOOTH * ex + (1 - CENTER_SMOOTH) * ex_f
-                    ey_f = CENTER_SMOOTH * ey + (1 - CENTER_SMOOTH) * ey_f
+                    world_pan += WORLD_SMOOTH * (wp - world_pan)
+                    world_tilt += WORLD_SMOOTH * (wt - world_tilt)
+                # Vận tốc hướng lửa (để đoán lửa đi đâu khi mất dấu)
+                if prev_world is not None and now > prev_world[2]:
+                    dtw = now - prev_world[2]
+                    vel_pan += 0.2 * ((world_pan - prev_world[0]) / dtw - vel_pan)
+                    vel_tilt += 0.2 * ((world_tilt - prev_world[1]) / dtw - vel_tilt)
+                prev_world = (world_pan, world_tilt, now)
 
-                # --- Vùng chồng lấn (hysteresis) ---
-                if abs(ex_f) > ZONE_OUTER:
+                # Độ lệch (đã lọc) giữa hướng lửa và hướng camera, theo tỉ lệ khung hình
+                err_x = PAN_DIR * (world_pan - snap_pan) / CAM_HFOV
+                err_y = TILT_DIR * (world_tilt - snap_tilt) / CAM_VFOV
+                if abs(err_x) > ZONE_OUTER:
                     active_x = True
-                elif abs(ex_f) < ZONE_INNER:
+                elif abs(err_x) < ZONE_INNER:
                     active_x = False
-                if abs(ey_f) > ZONE_OUTER:
+                if abs(err_y) > ZONE_OUTER:
                     active_y = True
-                elif abs(ey_f) < ZONE_INNER:
+                elif abs(err_y) < ZONE_INNER:
                     active_y = False
+                if active_x or active_y:
+                    hw.track(world_pan if active_x else None,
+                             world_tilt if active_y else None)
 
-                # --- Góc đích = góc lúc chụp + độ lệch đổi ra độ (chỉ sửa TRACK_GAIN phần) ---
-                new_pan = new_tilt = None
-                if active_x:
-                    new_pan = snap_pan + PAN_DIR * ex_f * CAM_HFOV * TRACK_GAIN
-                elif first:
-                    new_pan = snap_pan           # vừa thấy lửa: dừng radar ngay tại chỗ
-                if active_y:
-                    new_tilt = snap_tilt + TILT_DIR * ey_f * CAM_VFOV * TRACK_GAIN
-                elif first:
-                    new_tilt = snap_tilt
-                if new_pan is not None or new_tilt is not None or first:
-                    hw.track(new_pan, new_tilt)
-
-                # --- Kiểm tra khóa mục tiêu ---
-                if abs(ex_f) < LOCK_TOLERANCE and abs(ey_f) < LOCK_TOLERANCE:
+                if abs(err_x) < LOCK_TOLERANCE and abs(err_y) < LOCK_TOLERANCE:
                     lock_count = min(lock_count + 1, LOCK_FRAMES)
                 else:
                     lock_count = max(lock_count - 1, 0)
+            if present:
                 locked = lock_count >= LOCK_FRAMES
+                phase = "track"
             else:
                 lock_count = 0
-                if prev_target:
-                    print(f"[SERVO] Mất dấu lửa -> đứng yên chờ {RADAR_START_DELAY:.1f}s "
-                          "rồi quét radar")
-                    hw.hold()
-                if now - last_seen > RADAR_START_DELAY:
+                prev_m = None
+                if prev_present:
+                    # --- Bộ nhớ: quay lại chỗ lửa cuối cùng (+ dự đoán theo vận tốc) ---
+                    if not need_init:
+                        vp = float(np.clip(vel_pan, -30, 30))
+                        vt = float(np.clip(vel_tilt, -30, 30))
+                        mem = (world_pan + vp * PREDICT_TIME, world_tilt + vt * PREDICT_TIME)
+                    elif hotspots:                 # AI mới thấy thoáng qua -> dùng bộ nhớ AI
+                        mem = (hotspots[0][0], hotspots[0][1])
+                    else:
+                        mem = None
+                    if mem:
+                        print(f"[NHỚ] Mất dấu lửa -> quay lại chỗ lửa cuối cùng "
+                              f"PAN {mem[0]:.1f}° TILT {mem[1]:.1f}° (chờ {RECALL_DWELL:.1f}s)")
+                        hw.track(mem[0], mem[1], reason="QUAY LẠI")
+                        phase, phase_t, arrive_t = "recall", now, None
+                    else:
+                        phase = "radar"
+                elif phase == "recall":
+                    tp, tt = hw.target["pan"], hw.target["tilt"]
+                    if arrive_t is None and abs(hw.pan_angle - tp) < 2 and abs(hw.tilt_angle - tt) < 2:
+                        arrive_t = now
+                    if (arrive_t and now - arrive_t > RECALL_DWELL) or now - phase_t > 4.0:
+                        hw.start_search(tp, tt, LOCAL_RANGE, LOCAL_SPEED, LOCAL_TURNS)
+                        phase = "search"
+                elif phase == "search":
+                    if hw.search_done:
+                        print("[NHỚ] Quét hẹp không thấy lửa -> quét RADAR toàn bộ")
+                        phase = "radar"
+                else:
+                    phase = "radar"
+                if phase == "radar":
                     hw.start_radar()
 
             if locked != prev_locked:
                 print(f"[SERVO] {'ĐÃ KHÓA MỤC TIÊU (lửa ở giữa khung hình)' if locked else 'Mất khóa mục tiêu'}"
                       f" | PAN {hw.pan_angle:.1f}° TILT {hw.tilt_angle:.1f}°")
-            prev_target, prev_locked = bool(target), locked
+            prev_present, prev_locked = present, locked
 
             # --- Điều khiển máy bơm (chỉ khi có --pump) ---
             if args.pump:
@@ -655,44 +913,48 @@ def main():
 
             state = ("TARGET LOCKED! PUMPING..." if hw.pump_on else
                      "TARGET LOCKED!" if locked else
-                     "TRACKING FIRE..." if target else
+                     "TRACKING FIRE..." if present else
+                     "RECALL: BACK TO LAST FIRE..." if phase == "recall" else
+                     "LOCAL SEARCH..." if phase == "search" else
                      "RADAR SCANNING..." if hw.mode == "radar" else "SEARCHING...")
 
             if args.no_display:
                 if now - last_log >= 1.0:
                     last_log = now
-                    extra = (f" | {target[5]} {target[4]:.2f} lệch ({ex_f:+.2f},{ey_f:+.2f})"
-                             if target else "")
-                    print(f"[{state}] FPS {fps:.1f} | Pan {hw.pan_angle:.0f} | "
-                          f"Tilt {hw.tilt_angle:.0f}{extra}")
+                    extra = (f" | {name} {conf:.2f} hướng lửa ({world_pan:.0f}°,{world_tilt:.0f}°)"
+                             if present else "")
+                    print(f"[{state}] CAM {fps:.0f} FPS | AI {ai.fps:.1f} FPS | "
+                          f"Pan {hw.pan_angle:.0f} | Tilt {hw.tilt_angle:.0f}{extra}")
                 continue
 
-            # --- Vẽ & hiển thị (vẽ thẳng lên frame, không copy) ---
-            cv2.drawMarker(frame, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
-            # Vùng vàng: lửa trong vùng này servo không xoay (vùng chồng lấn ngoài)
-            # Vùng xanh dương: vùng khóa mục tiêu
+            # --- Vẽ & hiển thị (vẽ lên bản sao: luồng AI có thể đang đọc frame gốc) ---
+            view = frame.copy()
+            cv2.drawMarker(view, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
+            # Vùng vàng: lửa trong vùng này servo không xoay | xanh dương: vùng khóa mục tiêu
             for frac, col in ((ZONE_OUTER, (0, 255, 255)), (LOCK_TOLERANCE, (255, 128, 0))):
                 zx, zy = int(frac * w), int(frac * h)
-                cv2.rectangle(frame, (cx - zx, cy - zy), (cx + zx, cy + zy), col, 1)
-            if target:
+                cv2.rectangle(view, (cx - zx, cy - zy), (cx + zx, cy + zy), col, 1)
+            if present:
                 color = (0, 0, 255) if locked else (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{name} {conf:.2f}", (x1, max(y1 - 5, 12)),
+                cv2.rectangle(view, box[:2], box[2:], color, 2)
+                cv2.putText(view, f"{name} {conf:.2f}", (box[0], max(box[1] - 5, 12)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-                cv2.line(frame, (cx, cy), (tx, ty), color, 1)
-            color = (0, 0, 255) if locked else (0, 255, 0) if target else (200, 200, 200)
-            cv2.putText(frame, state, (5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-            info = f"FPS {fps:.1f} Pan {hw.pan_angle:.0f} Tilt {hw.tilt_angle:.0f}"
-            if hw.sim:
-                info += " SIM"
-            cv2.putText(frame, info, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                if meas:
+                    cv2.circle(view, (int(meas[0]), int(meas[1])), 4, color, -1)
+                    cv2.line(view, (cx, cy), (int(meas[0]), int(meas[1])), color, 1)
+            color = (0, 0, 255) if locked else (0, 255, 0) if present else (200, 200, 200)
+            cv2.putText(view, state, (5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            info = (f"CAM {fps:.0f} AI {ai.fps:.1f} | Pan {hw.pan_angle:.0f} "
+                    f"Tilt {hw.tilt_angle:.0f}{' SIM' if hw.sim else ''}")
+            cv2.putText(view, info, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-            cv2.imshow(WINDOW_NAME, frame)
+            cv2.imshow(WINDOW_NAME, view)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     except KeyboardInterrupt:
         print("\n[RUN] Dừng bởi người dùng.")
     finally:
+        ai.stop()
         hw.close()
         cam.release()
         cv2.destroyAllWindows()
