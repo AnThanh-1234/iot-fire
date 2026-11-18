@@ -91,7 +91,22 @@ HOTSPOT_SLOW = 0.4     # ...thì chậm lại còn 40% tốc độ để AI kị
 # ===================== TỰ PHÁT HIỆN SERVO QUAY NGƯỢC =====================
 # Khi servo xoay mà lửa trong ảnh dịch NGƯỢC với dự đoán -> PAN_DIR/TILT_DIR bị sai,
 # chương trình tự đảo chiều và in ra giá trị đúng để sửa vĩnh viễn trong file.
-AUTO_DIR = True
+
+# ===================== PHÁT HIỆN SERVO BỊ CẤN (KẸT CƠ KHÍ) =====================
+# Servo thường không báo vị trí thật -> dùng CAMERA làm cảm biến: ra lệnh xoay mà khung cảnh
+# trong ảnh KHÔNG dịch chuyển => servo đang bị cấn. Khi đó lùi ra, thu hẹp giới hạn góc
+# và LƯU vào servo_limits.json (lần chạy sau vẫn nhớ). Xóa: chạy với --reset-limits
+STALL_DETECT = False      # THỬ NGHIỆM, đang TẮT: còn báo nhầm khi khung cảnh trơn. Bật: True
+STALL_MIN_CMD = 8.0       # Phải ra lệnh xoay tổng ≥ 8° liên tục mới xét (tránh nhầm do nhiễu)
+STALL_RATIO = 0.25        # Ảnh dịch < 25% so với lệnh => coi là bị cấn
+STALL_GAP = 5.0           # Lúc đổi chiều: góc lệnh đi quá vị trí thật ≥ 5° => cấn (gần biên)
+STALL_MARGIN = 3.0        # Giới hạn mới = chỗ cấn lùi vào 3°
+STALL_MIN_RESPONSE = 0.05 # Độ tin cậy đo dịch ảnh tối thiểu
+STALL_MIN_TEXTURE = 8.0   # Khung cảnh phải đủ chi tiết (độ lệch chuẩn độ sáng) - tường trắng/tối thì bỏ qua
+STALL_MIN_SPAN = 0.3      # Không thu hẹp giới hạn nhỏ hơn 30% khoảng ban đầu
+LIMITS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servo_limits.json")
+
+AUTO_DIR = False        # Mặc định TẮT: chỉnh PAN_DIR/TILT_DIR bằng tay 1 lần (cách chuẩn)
 AUTO_DIR_MIN_MOVE = 3.0   # Servo phải xoay tổng cộng ≥ 3° trong lúc thấy lửa mới kết luận
 
 # ===================== BÁM LỬA CHỐNG GIẬT =====================
@@ -110,7 +125,18 @@ AI_CONFIRM_TIMEOUT = 1.0  # AI không thấy lửa quá 1s thì bỏ bám (chố
 #   -> lửa dao động nhẹ quanh tâm sẽ KHÔNG làm servo giật qua lại.
 ZONE_OUTER = 0.12
 ZONE_INNER = 0.04
-WORLD_SMOOTH = 0.25   # Lọc mượt vị trí lửa mỗi khung hình (0..1): nhỏ = mượt hơn, phản ứng chậm hơn
+WORLD_SMOOTH = 0.25   # Lọc mượt hướng lửa (dùng cho bộ nhớ lửa / dự đoán khi mất dấu)
+
+# Bộ điều khiển PID cho từng trục - cách chuẩn trong các dự án pan-tilt tracking.
+# Đầu vào: độ lệch tâm e (tỉ lệ khung hình, -0.5..0.5). Đầu ra: góc cần xoay thêm (× góc nhìn).
+#   KP: lệch càng xa xoay càng mạnh (chính). Tăng nếu bám chậm, giảm nếu dao động.
+#   KI: bù lệch nhỏ còn sót lại lâu (lửa dừng hơi lệch tâm mãi). Để nhỏ.
+#   KD: hãm khi đang tiến nhanh về tâm -> chống vọt lố. Tăng nếu bị vọt qua tâm.
+PID_KP = 0.6
+PID_KI = 0.15
+PID_KD = 0.05
+PID_I_LIMIT = 0.3     # Giới hạn phần tích phân (chống "tích lũy quá đà" - anti-windup)
+ERR_SMOOTH = 0.5      # Lọc mượt độ lệch tâm trước khi đưa vào PID (0..1)
 LOCK_TOLERANCE = 0.10 # Lệch tâm < 10% khung hình coi là "đã nhắm"
 LOCK_FRAMES = 8       # Số khung hình liên tiếp nhắm trúng mới coi là khóa mục tiêu
 
@@ -284,6 +310,10 @@ class Hardware:
         self._log_t, self._log_ref = 0.0, dict(self.target)   # chống spam log
         self.hotspots = []          # các góc PAN từng có lửa (radar đi chậm lại ở đó)
         self.sweep, self.search_done = None, False
+        # Giới hạn góc ĐANG DÙNG (có thể bị thu hẹp khi phát hiện servo bị cấn)
+        self.limits = {"pan": [float(PAN_MIN), float(PAN_MAX)],
+                       "tilt": [float(TILT_MIN), float(TILT_MAX)]}
+        self._load_limits()
         self.go_home("Khởi động")
 
         self.running = True
@@ -303,16 +333,80 @@ class Hardware:
         with self.lock:
             return self.angle["pan"], self.angle["tilt"]
 
+    # ---------- giới hạn góc (tự học khi bị cấn) ----------
+    def radar_range(self):
+        lo, hi = self.limits["pan"]
+        return max(RADAR_MIN, lo), min(RADAR_MAX, hi)
+
+    def _load_limits(self):
+        try:
+            import json
+            with open(LIMITS_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        for axis, (lo0, hi0) in (("pan", (PAN_MIN, PAN_MAX)), ("tilt", (TILT_MIN, TILT_MAX))):
+            if axis in saved:
+                lo, hi = saved[axis]
+                self.limits[axis] = [max(lo0, float(lo)), min(hi0, float(hi))]
+        print(f"[CẤN] Nạp giới hạn đã học từ {os.path.basename(LIMITS_FILE)}: "
+              f"PAN {self.limits['pan'][0]:.0f}°..{self.limits['pan'][1]:.0f}° | "
+              f"TILT {self.limits['tilt'][0]:.0f}°..{self.limits['tilt'][1]:.0f}°")
+
+    def _save_limits(self):
+        try:
+            import json
+            with open(LIMITS_FILE, "w", encoding="utf-8") as f:
+                json.dump({**self.limits, "cap_nhat": time.strftime("%Y-%m-%d %H:%M:%S")},
+                          f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[CẤN] Không lưu được {LIMITS_FILE}: {e}")
+
+    def report_stall(self, axis, side, angle):
+        """Servo `axis` bị cấn khi xoay về phía `side` (+1 tăng góc / -1 giảm góc) tại `angle`.
+        Thu hẹp giới hạn, lùi servo ra khỏi chỗ cấn, lưu lại."""
+        lo0, hi0 = (PAN_MIN, PAN_MAX) if axis == "pan" else (TILT_MIN, TILT_MAX)
+        min_span = STALL_MIN_SPAN * (hi0 - lo0)
+        with self.lock:
+            lo, hi = self.limits[axis]
+            if side > 0:
+                new = max(lo + min_span, angle - STALL_MARGIN)
+                if new >= hi - 0.5:
+                    return
+                self.limits[axis][1] = new
+            else:
+                new = min(hi - min_span, angle + STALL_MARGIN)
+                if new <= lo + 0.5:
+                    return
+                self.limits[axis][0] = new
+            # Đồng bộ góc lệnh = vị trí THẬT của servo (lệnh đã chạy quá chỗ cấn),
+            # rồi lùi ra khỏi chỗ cấn ngay (servo kẹt kéo dòng lớn, nóng, có thể cháy)
+            lo, hi = self.limits[axis]
+            self.angle[axis] = float(angle)
+            self.target[axis] = float(np.clip(self.target[axis], lo, hi))
+            if axis == "pan" and self.mode in ("radar", "search"):
+                self.radar_dir = -side
+                self.target["pan"] = new
+                if self.mode == "search":
+                    self.sweep["lo"] = max(self.sweep["lo"], lo)
+                    self.sweep["hi"] = min(self.sweep["hi"], hi)
+            old = (lo0, hi0)
+        print(f"[CẤN] Servo {axis.upper()} bị CẤN tại ~{angle:.1f}° khi xoay "
+              f"{'tăng' if side > 0 else 'giảm'} góc -> giới hạn mới {axis.upper()} "
+              f"{lo:.0f}°..{hi:.0f}° (ban đầu {old[0]}°..{old[1]}°), lùi servo ra")
+        self._save_limits()
+
     def start_radar(self):
         """Bắt đầu quét radar từ vị trí hiện tại, hướng về phía đầu xa hơn."""
+        r_lo, r_hi = self.radar_range()
         with self.lock:
             if self.mode == "radar":
                 return
             self.mode = "radar"
             self.target["pan"] = self.angle["pan"]
-            mid = (RADAR_MIN + RADAR_MAX) / 2
+            mid = (r_lo + r_hi) / 2
             self.radar_dir = 1 if self.angle["pan"] < mid else -1
-        print(f"[SERVO] Không thấy lửa -> RADAR quét {RADAR_MIN}°↔{RADAR_MAX}° "
+        print(f"[SERVO] Không thấy lửa -> RADAR quét {r_lo:.0f}°↔{r_hi:.0f}° "
               f"({RADAR_SPEED:.0f}°/s), TILT về {TILT_HOME}°")
 
     def hold(self):
@@ -323,11 +417,11 @@ class Hardware:
 
     def start_search(self, center, tilt, rng, speed, turns):
         """Quét hẹp quanh `center` (± rng độ), chạm biên `turns` lần thì xong (search_done)."""
-        lo, hi = max(PAN_MIN, center - rng), min(PAN_MAX, center + rng)
+        lo, hi = max(self.limits["pan"][0], center - rng), min(self.limits["pan"][1], center + rng)
         with self.lock:
             self.mode = "search"
             self.sweep = dict(lo=lo, hi=hi, speed=speed, turns=turns,
-                              tilt=float(np.clip(tilt, TILT_MIN, TILT_MAX)))
+                              tilt=float(np.clip(tilt, *self.limits["tilt"])))
             self.target["pan"] = self.angle["pan"]
             self.radar_dir = 1 if self.angle["pan"] < (lo + hi) / 2 else -1
             self.search_done = False
@@ -340,8 +434,8 @@ class Hardware:
         with self.lock:
             was_radar = self.mode in ("radar", "search")
             self.mode = "track"
-            for axis, val, lo, hi in (("pan", pan, PAN_MIN, PAN_MAX),
-                                      ("tilt", tilt, TILT_MIN, TILT_MAX)):
+            for axis, val, lo, hi in (("pan", pan, *self.limits["pan"]),
+                                      ("tilt", tilt, *self.limits["tilt"])):
                 if val is None:
                     continue
                 c = float(np.clip(val, lo, hi))
@@ -378,7 +472,9 @@ class Hardware:
                 if self.mode in ("radar", "search"):
                     # Góc đích chạy đều qua lại, servo bám theo mượt (đổi chiều êm ở 2 đầu)
                     if self.mode == "radar":
-                        lo, hi, speed, tilt = RADAR_MIN, RADAR_MAX, RADAR_SPEED, TILT_HOME
+                        lo, hi = max(RADAR_MIN, self.limits["pan"][0]), min(RADAR_MAX, self.limits["pan"][1])
+                        speed = RADAR_SPEED
+                        tilt = float(np.clip(TILT_HOME, *self.limits["tilt"]))
                         # Gần chỗ từng có lửa -> đi chậm lại cho AI kịp nhận diện
                         if any(abs(self.angle["pan"] - hp) < HOTSPOT_RANGE for hp in self.hotspots):
                             speed *= HOTSPOT_SLOW
@@ -439,12 +535,14 @@ class Hardware:
 
     def go_home(self, why):
         """Đưa cả 2 servo về góc ban đầu (90°) ngay lập tức và chờ servo quay tới nơi."""
-        print(f"[SERVO] {why}: quay về góc ban đầu PAN {PAN_HOME}° | TILT {TILT_HOME}°")
+        # Góc HOME luôn nằm trong giới hạn đang dùng (kể cả giới hạn đã học khi bị cấn)
+        home = {"pan": float(np.clip(PAN_HOME, *self.limits["pan"])),
+                "tilt": float(np.clip(TILT_HOME, *self.limits["tilt"]))}
+        print(f"[SERVO] {why}: quay về góc ban đầu PAN {home['pan']:.0f}° | TILT {home['tilt']:.0f}°")
         if not self.sim:
-            self.servos["pan"].angle = PAN_HOME
-            self.servos["tilt"].angle = TILT_HOME
+            self.servos["pan"].angle = home["pan"]
+            self.servos["tilt"].angle = home["tilt"]
             time.sleep(HOME_SETTLE)
-        home = {"pan": float(PAN_HOME), "tilt": float(TILT_HOME)}
         self.angle, self.target, self.sent = dict(home), dict(home), dict(home)
 
     def pump(self, on):
@@ -678,6 +776,107 @@ def pick_target(dets, fire_classes):
     return max(fires, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
 
 
+class StallDetector:
+    """Phát hiện servo bị CẤN bằng camera.
+    Mỗi khung hình đo khung cảnh dịch bao nhiêu (tương quan pha - cv2.phaseCorrelate),
+    đổi ra độ rồi so với góc đã RA LỆNH cho servo. Lệnh xoay ≥ STALL_MIN_CMD độ mà ảnh dịch
+    < STALL_RATIO lần lệnh => servo bị kẹt cơ khí ở đó."""
+
+    SIZE = (160, 120)   # ảnh thu nhỏ để đo cho nhanh (~1ms)
+
+    def __init__(self):
+        self.prev = None
+        self.win = cv2.createHanningWindow(self.SIZE, cv2.CV_32F)
+        self.acc = {a: None for a in ("pan", "tilt")}
+        self.carry = {a: None for a in ("pan", "tilt")}   # vị trí thật nối sang cửa sổ sau
+        self.pause_until = 0.0
+
+    def update(self, frame, pan, tilt, now):
+        """Trả về danh sách (trục, chiều, góc_cấn) nếu phát hiện cấn."""
+        g = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), self.SIZE).astype(np.float32)
+        events = []
+        if self.prev is not None:
+            pg, ppan, ptilt = self.prev
+            (dx, dy), resp = cv2.phaseCorrelate(pg, g, self.win)
+            if min(float(g.std()), float(pg.std())) < STALL_MIN_TEXTURE:
+                resp = 0.0     # khung cảnh trơn (tường trắng, tối): không đo được dịch -> bỏ qua
+            W, H = self.SIZE
+            for axis, d_px, size, fov, sign, ang, pang in (
+                    ("pan", dx, W, CAM_HFOV, PAN_DIR, pan, ppan),
+                    ("tilt", dy, H, CAM_VFOV, TILT_DIR, tilt, ptilt)):
+                d_cmd = ang - pang
+                # Ảnh dịch đổi ra "độ servo thật sự đã quay" (≈ d_cmd nếu servo quay bình thường)
+                d_real = -sign * d_px / size * fov
+                a = self.acc[axis]
+                if abs(d_cmd) < 0.1 or resp < STALL_MIN_RESPONSE:
+                    if a and now - a["t"] > 0.4:
+                        self.acc[axis] = None        # đứng yên / ảnh không tin cậy -> bỏ cửa sổ
+                    continue
+                if a is None or np.sign(d_cmd) != np.sign(a["cmd"]):
+                    # ĐỔI CHIỀU (vd radar chạm biên): nếu góc lệnh đã đi quá vị trí thật
+                    # ≥ STALL_GAP độ thì servo bị cấn ở gần biên (cửa sổ chưa kịp đủ STALL_MIN_CMD)
+                    c = self.carry[axis]
+                    est, sd = None, 0
+                    if a is not None:
+                        est, sd = a["start"] + a["real"], np.sign(a["cmd"])
+                    elif c and now - c[2] < 0.5:
+                        est, sd = c[0], c[1]
+                    if est is not None and sd != np.sign(d_cmd) and (pang - est) * sd >= STALL_GAP \
+                            and now >= self.pause_until:
+                        events.append((axis, int(sd), est))
+                        self.acc[axis] = self.carry[axis] = None
+                        continue
+                    # Cửa sổ mới bắt đầu từ VỊ TRÍ THẬT ước lượng của cửa sổ trước (nếu vừa
+                    # xét xong cùng chiều), không phải góc lệnh - servo có thể đã kẹt một nửa
+                    start = c[0] if c and c[1] == np.sign(d_cmd) and now - c[2] < 0.5 else pang
+                    a = self.acc[axis] = {"cmd": 0.0, "real": 0.0, "start": start, "moving": None}
+                a["cmd"] += d_cmd
+                a["real"] += d_real
+                a["t"] = now
+                if abs(d_real) >= 0.5 * abs(d_cmd):
+                    a["moving"] = ang                 # khung hình này servo vẫn quay thật
+                if abs(a["cmd"]) >= STALL_MIN_CMD:
+                    if abs(a["real"]) < STALL_RATIO * abs(a["cmd"]) and now >= self.pause_until:
+                        # Vị trí THẬT của servo = góc lúc bắt đầu xét + quãng ảnh thực sự dịch
+                        # (không dùng góc ra lệnh: góc lệnh chạy trước servo thật)
+                        stuck_at = a["start"] + a["real"]
+                        events.append((axis, 1 if a["cmd"] > 0 else -1, stuck_at))
+                        self.carry[axis] = None
+                    elif abs(a["real"]) > 0.9 * abs(a["cmd"]):
+                        self.carry[axis] = None        # servo bám lệnh tốt -> không cần nối
+                    else:
+                        self.carry[axis] = (a["start"] + a["real"], np.sign(a["cmd"]), now)
+                    self.acc[axis] = None
+        self.prev = (g, pan, tilt)
+        return events
+
+    def pause(self, now, seconds):
+        """Tạm ngừng xét (vừa lùi servo ra khỏi chỗ cấn: góc lệnh và góc thật đang lệch nhau)."""
+        self.pause_until = now + seconds
+        self.acc = {a: None for a in ("pan", "tilt")}
+        self.carry = {a: None for a in ("pan", "tilt")}
+
+
+class PID:
+    """Bộ điều khiển PID cho 1 trục servo (giống các dự án pan-tilt phổ biến)."""
+
+    def __init__(self, kp, ki, kd, i_limit):
+        self.kp, self.ki, self.kd, self.i_limit = kp, ki, kd, i_limit
+        self.reset()
+
+    def reset(self):
+        self.i, self.d, self.prev_e, self.prev_t = 0.0, 0.0, None, None
+
+    def update(self, e, now):
+        if self.prev_t is not None and now > self.prev_t:
+            dt = now - self.prev_t
+            self.i = float(np.clip(self.i + e * dt, -self.i_limit, self.i_limit))
+            # Đạo hàm có lọc (đo lửa bị nhiễu -> D thô sẽ làm servo rung)
+            self.d += 0.3 * ((e - self.prev_e) / dt - self.d)
+        self.prev_e, self.prev_t = e, now
+        return self.kp * e + self.ki * self.i + self.kd * self.d
+
+
 class AsyncDetector:
     """Chạy YOLO ở luồng nền trên khung hình mới nhất -> luồng chính không phải chờ AI."""
 
@@ -824,6 +1023,9 @@ def main():
     ap.add_argument("--log-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
                     help="Thư mục lưu file log .txt (mặc định: logs/ cạnh script)")
     ap.add_argument("--no-log-file", action="store_true", help="Không ghi log ra file")
+    ap.add_argument("--reset-limits", action="store_true",
+                    help="Xóa giới hạn góc đã tự học khi servo bị cấn (servo_limits.json)")
+    ap.add_argument("--no-stall", action="store_true", help="Tắt phát hiện servo bị cấn")
     ap.add_argument("--servo-trace", action="store_true",
                     help="Ghi THÊM từng lệnh gửi servo ra file servo_trace_*.txt (để tìm nguyên nhân giật)")
     args = ap.parse_args()
@@ -856,7 +1058,11 @@ def main():
         print(f"[MODEL] Không có lớp {sorted(fire_classes)} trong model -> coi mọi vật là lửa.")
         fire_classes = set()
 
+    if args.reset_limits and os.path.exists(LIMITS_FILE):
+        os.remove(LIMITS_FILE)
+        print(f"[CẤN] Đã xóa giới hạn đã học ({os.path.basename(LIMITS_FILE)}) -> dùng lại giới hạn gốc")
     hw = Hardware(use_pump=args.pump, log=not args.no_servo_log, backend=args.servo, trace=trace)
+    stall = StallDetector() if STALL_DETECT and not args.no_stall else None
     try:
         cam = Camera(args.cam, FRAME_W, FRAME_H)
     except RuntimeError as e:
@@ -875,6 +1081,9 @@ def main():
     need_init = False
     world_pan = world_tilt = 0.0         # hướng của ngọn lửa (độ, đã lọc mượt)
     active_x = active_y = False          # trục đang trong pha "đang xoay" (hysteresis)
+    pid_x = PID(PID_KP, PID_KI, PID_KD, PID_I_LIMIT)
+    pid_y = PID(PID_KP, PID_KI, PID_KD, PID_I_LIMIT)
+    ex_f = ey_f = 0.0                    # độ lệch tâm đã lọc mượt
     prev_present = prev_locked = False
     # Bộ nhớ lửa
     hotspots = []                        # [[pan, tilt, thời điểm]] các chỗ từng có lửa
@@ -899,6 +1108,12 @@ def main():
             h, w = frame.shape[:2]
             cx, cy = w // 2, h // 2
             now = time.time()
+
+            # --- 0. Servo có bị cấn không? (ra lệnh xoay mà khung cảnh không dịch) ---
+            if stall:
+                for axis, side, at in stall.update(frame, snap_pan, snap_tilt, now):
+                    hw.report_stall(axis, side, at)
+                    stall.pause(now, 1.0)
 
             # --- 1. Có kết quả AI mới? ---
             res = ai.latest()
@@ -987,9 +1202,12 @@ def main():
                 # Hướng thật của ngọn lửa = góc servo + độ lệch đổi ra độ
                 wp = snap_pan + PAN_DIR * ex * CAM_HFOV
                 wt = snap_tilt + TILT_DIR * ey * CAM_VFOV
-                if need_init:
+                if need_init:                            # lửa mới: khởi tạo bộ lọc + PID
                     world_pan, world_tilt, need_init = wp, wt, False
                     vel_pan = vel_tilt = 0.0
+                    ex_f, ey_f = ex, ey
+                    pid_x.reset()
+                    pid_y.reset()
                 else:
                     world_pan += WORLD_SMOOTH * (wp - world_pan)
                     world_tilt += WORLD_SMOOTH * (wt - world_tilt)
@@ -1000,9 +1218,10 @@ def main():
                     vel_tilt += 0.2 * ((world_tilt - prev_world[1]) / dtw - vel_tilt)
                 prev_world = (world_pan, world_tilt, now)
 
-                # Độ lệch (đã lọc) giữa hướng lửa và hướng camera, theo tỉ lệ khung hình
-                err_x = PAN_DIR * (world_pan - snap_pan) / CAM_HFOV
-                err_y = TILT_DIR * (world_tilt - snap_tilt) / CAM_VFOV
+                # --- PID + vùng chết (deadzone có hysteresis) cho từng trục ---
+                ex_f += ERR_SMOOTH * (ex - ex_f)
+                ey_f += ERR_SMOOTH * (ey - ey_f)
+                err_x, err_y = ex_f, ey_f
                 if abs(err_x) > ZONE_OUTER:
                     active_x = True
                 elif abs(err_x) < ZONE_INNER:
@@ -1011,9 +1230,17 @@ def main():
                     active_y = True
                 elif abs(err_y) < ZONE_INNER:
                     active_y = False
-                if active_x or active_y:
-                    hw.track(world_pan if active_x else None,
-                             world_tilt if active_y else None)
+                new_pan = new_tilt = None
+                if active_x:
+                    new_pan = snap_pan + PAN_DIR * pid_x.update(err_x, now) * CAM_HFOV
+                else:
+                    pid_x.reset()                        # vào vùng tâm -> xóa tích phân
+                if active_y:
+                    new_tilt = snap_tilt + TILT_DIR * pid_y.update(err_y, now) * CAM_VFOV
+                else:
+                    pid_y.reset()
+                if new_pan is not None or new_tilt is not None:
+                    hw.track(new_pan, new_tilt)
 
                 if abs(err_x) < LOCK_TOLERANCE and abs(err_y) < LOCK_TOLERANCE:
                     lock_count = min(lock_count + 1, LOCK_FRAMES)
