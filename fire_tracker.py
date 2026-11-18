@@ -56,8 +56,10 @@ RELAY_ACTIVE_HIGH = False   # Đa số module relay 5V kích mức THẤP -> Fal
 
 # Thang góc servo 0°..180° (90° = chính giữa)
 PAN_MIN, PAN_MAX = 0, 180       # Giới hạn góc servo ngang (độ)
-TILT_MIN, TILT_MAX = 45, 150    # Giới hạn góc servo dọc (tránh gập quá, va chạm cơ khí)
-PAN_HOME, TILT_HOME = 90, 90    # Góc ban đầu: khởi động/thoát chương trình đều quay về đây
+TILT_MIN, TILT_MAX = 0, 10      # Giới hạn góc servo dọc: chỉ trong 0°..10°
+PAN_HOME, TILT_HOME = 90, 5     # Góc ban đầu: khởi động/thoát chương trình đều quay về đây
+                                # (TILT_HOME phải nằm trong TILT_MIN..TILT_MAX)
+TILT_HOME = min(max(TILT_HOME, TILT_MIN), TILT_MAX)   # an toàn: ép HOME vào trong giới hạn
 HOME_SETTLE = 0.6               # Thời gian chờ (giây) cho servo quay tới góc ban đầu
 
 PAN_DIR = 1           # Đảo chiều nếu servo xoay ngược hướng lửa (1 hoặc -1)
